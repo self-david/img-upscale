@@ -3,16 +3,37 @@
 
 use serde_json::Value;
 
-use super::{normalize_license, ImageHit};
+use super::{normalize_license, ImageHit, Keys};
 
 const UA: &str = "img-upscaler/0.3 (app de escritorio personal)";
 
-pub fn client() -> Result<reqwest::Client, String> {
+pub fn client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(12))
         .user_agent(UA)
         .build()
-        .map_err(|error| format!("No se pudo preparar la conexión: {error}"))
+        .unwrap_or_default()
+}
+
+/// Despacha a la fuente pedida; una desconocida simplemente no devuelve nada.
+pub async fn fetch(
+    id: &str,
+    client: &reqwest::Client,
+    keys: &Keys,
+    query: &str,
+    page: u32,
+    limit: usize,
+) -> Result<Vec<ImageHit>, String> {
+    match id {
+        "openverse" => openverse(client, query, page, limit).await,
+        "commons" => wikimedia(client, query, page, limit).await,
+        "brave" => brave(client, &keys.brave, query, page, limit).await,
+        "google_images" | "yandex_images" => {
+            serpapi(client, &keys.serpapi, id, query, page).await
+        }
+        "searxng" => searxng(client, &keys.searxng, query, page).await,
+        _ => Ok(Vec::new()),
+    }
 }
 
 fn text(value: &Value, path: &[&str]) -> Option<String> {
@@ -225,7 +246,6 @@ pub async fn serpapi(
     client: &reqwest::Client,
     key: &str,
     engine: &str,
-    source_id: &str,
     query: &str,
     page: u32,
 ) -> Result<Vec<ImageHit>, String> {
@@ -259,7 +279,7 @@ pub async fn serpapi(
         .filter_map(|item| {
             let url = text(item, &["original"]).or_else(|| text(item, &["thumbnail"]))?;
             Some(ImageHit {
-                id: format!("{source_id}:{url}"),
+                id: format!("{engine}:{url}"),
                 thumb: text(item, &["thumbnail"]).unwrap_or_else(|| url.clone()),
                 page: text(item, &["link"]),
                 title: text(item, &["title"]).unwrap_or_else(|| "Sin título".into()),
@@ -268,7 +288,7 @@ pub async fn serpapi(
                 width: number(item, &["original_width"]),
                 height: number(item, &["original_height"]),
                 url,
-                source: source_id.into(),
+                source: engine.into(),
             })
         })
         .collect())

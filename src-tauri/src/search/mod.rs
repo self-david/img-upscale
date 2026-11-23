@@ -42,9 +42,6 @@ pub struct SearchRequest {
     pub page: u32,
     #[serde(default)]
     pub filters: Filters,
-    /// vacío = todas las fuentes activas
-    #[serde(default)]
-    pub sources: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -55,6 +52,17 @@ pub struct SourceStatus {
     pub state: String,
     pub count: usize,
     pub message: Option<String>,
+}
+
+impl SourceStatus {
+    pub fn new(id: &str, state: &str, count: usize, message: Option<String>) -> Self {
+        Self {
+            id: id.to_string(),
+            state: state.to_string(),
+            count,
+            message,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -247,100 +255,42 @@ pub fn statuses_in_order(statuses: Vec<SourceStatus>) -> Vec<SourceStatus> {
     statuses
 }
 
+const LIMIT: usize = 24;
+
 /// Lanza todos los proveedores activos en paralelo y fusiona lo que llegue.
 pub async fn run(request: &SearchRequest, keys: &Keys) -> SearchResponse {
     let started = std::time::Instant::now();
-    let limit = 24usize;
-
-    let client = match adapters::client() {
-        Ok(client) => client,
-        Err(message) => {
-            return SearchResponse {
-                hits: Vec::new(),
-                statuses: SOURCES
-                    .iter()
-                    .map(|spec| SourceStatus {
-                        id: spec.id.to_string(),
-                        state: "error".to_string(),
-                        count: 0,
-                        message: Some(message.clone()),
-                    })
-                    .collect(),
-                took_ms: 0,
-            }
-        }
-    };
+    let client = adapters::client();
 
     let mut statuses = Vec::new();
-    let mut tasks = Vec::new();
-
+    let mut active = Vec::new();
     for spec in SOURCES {
-        let wanted = if request.sources.is_empty() {
-            keys.enabled(spec.id)
-        } else {
-            request.sources.iter().any(|id| id == spec.id)
-        };
-        if !wanted {
-            statuses.push(SourceStatus {
-                id: spec.id.to_string(),
-                state: "off".to_string(),
-                count: 0,
-                message: None,
-            });
-            continue;
-        }
         if !keys.configured(spec) {
-            statuses.push(SourceStatus {
-                id: spec.id.to_string(),
-                state: "no-key".to_string(),
-                count: 0,
-                message: None,
-            });
-            continue;
+            statuses.push(SourceStatus::new(spec.id, "no-key", 0, None));
+        } else if !keys.enabled(spec.id) {
+            statuses.push(SourceStatus::new(spec.id, "off", 0, None));
+        } else {
+            active.push(spec);
         }
-
-        let query = request.query.clone();
-        let page = request.page;
-        let keys = keys.clone();
-        let client = client.clone();
-        tasks.push(async move {
-            let result = match spec.id {
-                "openverse" => adapters::openverse(&client, &query, page, limit).await,
-                "commons" => adapters::wikimedia(&client, &query, page, limit).await,
-                "brave" => adapters::brave(&client, &keys.brave, &query, page, limit).await,
-                "google_images" => {
-                    adapters::serpapi(&client, &keys.serpapi, "google_images", "google_images", &query, page)
-                        .await
-                }
-                "yandex_images" => {
-                    adapters::serpapi(&client, &keys.serpapi, "yandex_images", "yandex_images", &query, page)
-                        .await
-                }
-                "searxng" => adapters::searxng(&client, &keys.searxng, &query, page).await,
-                _ => Ok(Vec::new()),
-            };
-            (spec.id, result)
-        });
     }
+
+    let tasks = active.into_iter().map(|spec| {
+        let client = client.clone();
+        async move {
+            let hits = adapters::fetch(spec.id, &client, keys, &request.query, request.page, LIMIT).await;
+            (spec.id, hits)
+        }
+    });
 
     let mut per_source = Vec::new();
     for (id, result) in join_all(tasks).await {
         match result {
             Ok(hits) => {
-                statuses.push(SourceStatus {
-                    id: id.to_string(),
-                    state: if hits.is_empty() { "empty" } else { "ok" }.to_string(),
-                    count: hits.len(),
-                    message: None,
-                });
+                let state = if hits.is_empty() { "empty" } else { "ok" };
+                statuses.push(SourceStatus::new(id, state, hits.len(), None));
                 per_source.push((id.to_string(), hits));
             }
-            Err(message) => statuses.push(SourceStatus {
-                id: id.to_string(),
-                state: "error".to_string(),
-                count: 0,
-                message: Some(message),
-            }),
+            Err(message) => statuses.push(SourceStatus::new(id, "error", 0, Some(message))),
         }
     }
 
@@ -348,5 +298,88 @@ pub async fn run(request: &SearchRequest, keys: &Keys) -> SearchResponse {
         hits: merge(per_source, &request.filters),
         statuses: statuses_in_order(statuses),
         took_ms: started.elapsed().as_millis() as u64,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hit(id: &str, url: &str, width: u32, height: u32, license: Option<&str>) -> ImageHit {
+        ImageHit {
+            id: id.to_string(),
+            thumb: url.to_string(),
+            url: url.to_string(),
+            page: None,
+            title: id.to_string(),
+            author: None,
+            license: license.map(|value| value.to_string()),
+            width,
+            height,
+            source: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn merge_dedupes_urls_ignoring_query_and_case() {
+        let merged = merge(
+            vec![
+                ("a".to_string(), vec![hit("uno", "https://cdn.test/foto.jpg?w=200", 2000, 1000, None)]),
+                ("b".to_string(), vec![hit("dos", "https://CDN.test/foto.jpg", 2000, 1000, Some("CC0"))]),
+            ],
+            &Filters::default(),
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].license.as_deref(), Some("CC0"), "hereda la licencia de la otra fuente");
+    }
+
+    #[test]
+    fn merge_rewards_hits_found_by_several_sources() {
+        let merged = merge(
+            vec![
+                ("a".to_string(), vec![hit("solo-a", "https://x/solo.jpg", 0, 0, None), hit("comun", "https://x/comun.jpg", 0, 0, None)]),
+                ("b".to_string(), vec![hit("comun-b", "https://x/comun.jpg", 0, 0, None)]),
+            ],
+            &Filters::default(),
+        );
+
+        let order: Vec<&str> = merged.iter().map(|entry| entry.title.as_str()).collect();
+        assert_eq!(order, vec!["comun", "solo-a"]);
+    }
+
+    #[test]
+    fn filters_drop_small_or_misaligned_hits() {
+        let hits = vec![
+            hit("grande", "https://x/1.jpg", 2400, 1600, Some("CC BY 4.0")),
+            hit("mediana", "https://x/2.jpg", 1000, 900, Some("CC BY 4.0")),
+            hit("vertical", "https://x/3.jpg", 1400, 2400, None),
+        ];
+
+        let large = merge(
+            vec![("a".to_string(), hits.clone())],
+            &Filters { size: Some("large".to_string()), ..Filters::default() },
+        );
+        assert_eq!(large.len(), 2);
+
+        let open = merge(
+            vec![("a".to_string(), hits.clone())],
+            &Filters { open_license: Some(true), ..Filters::default() },
+        );
+        assert!(open.iter().all(|entry| entry.license.is_some()));
+
+        let portrait = merge(
+            vec![("a".to_string(), hits)],
+            &Filters { orientation: Some("portrait".to_string()), ..Filters::default() },
+        );
+        assert_eq!(portrait.len(), 1);
+        assert_eq!(portrait[0].title, "vertical");
+    }
+
+    #[test]
+    fn license_labels_are_readable() {
+        assert_eq!(normalize_license("cc0", None).as_deref(), Some("Dominio público"));
+        assert_eq!(normalize_license("by-sa", Some("4.0")).as_deref(), Some("CC BY SA 4.0"));
+        assert_eq!(normalize_license("  ", None), None);
     }
 }

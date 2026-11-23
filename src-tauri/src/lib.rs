@@ -704,11 +704,11 @@ async fn reverse_image_search(
     }
     let started = Instant::now();
     let bytes = upload_bytes(&PathBuf::from(&path))?;
-    let client = search::adapters::client()?;
-    let hits = search::adapters::lens(&client, &settings.serpapi, bytes).await?;
+    let hits = search::adapters::lens(&search::adapters::client(), &settings.serpapi, bytes).await?;
+    let state = if hits.is_empty() { "empty" } else { "ok" };
     Ok(search::SearchResponse {
+        statuses: vec![search::SourceStatus::new("lens", state, hits.len(), None)],
         hits,
-        statuses: Vec::new(),
         took_ms: started.elapsed().as_millis() as u64,
     })
 }
