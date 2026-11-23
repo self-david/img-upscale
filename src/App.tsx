@@ -34,6 +34,8 @@ const LEVELS: Array<{ id: Level; name: string; detail: string; time: string }> =
 ];
 
 type GpuInfo = { id: number; name: string; best: boolean };
+type Chroma = "420" | "444";
+type OutFormat = "auto" | "webp";
 
 /// «NVIDIA GeForce RTX 4060 Laptop GPU» → «RTX 4060 Laptop GPU» para que quepa.
 const shortGpu = (name: string) =>
@@ -181,6 +183,8 @@ export default function App() {
   const [level, setLevel] = useState<Level>("potente");
   const [removeBg, setRemoveBg] = useState(false);
   const [quality, setQuality] = useState(90);
+  const [chroma, setChroma] = useState<Chroma>("420");
+  const [outFormat, setOutFormat] = useState<OutFormat>("auto");
   const [device, setDevice] = useState<number | null>(null);
   const [gpus, setGpus] = useState<GpuInfo[]>([]);
   const [section, setSection] = useState<Section>("escalar");
@@ -517,14 +521,16 @@ export default function App() {
   };
 
   /// Ajustes actuales: si cambian, las imágenes ya escaladas vuelven a la cola.
-  /// La calidad sólo cuenta cuando la salida es JPG: PNG y WebP no se
-  /// recomprimen, así que cambiarla no debe re-encolarlos.
+  /// Sólo cuenta lo que afecta a la salida de esa imagen: la calidad y el
+  /// submuestreo en JPG, la calidad en WebP y nada en PNG.
   const recipeFor = useCallback(
-    (path: string) =>
-      `${level}:${scale}:${removeBg ? 1 : 0}:${
-        !removeBg && /\.jpe?g$/i.test(path) ? quality : "sin-jpeg"
-      }`,
-    [level, scale, removeBg, quality],
+    (path: string) => {
+      const base = `${level}:${scale}:${removeBg ? 1 : 0}`;
+      if (removeBg) return `${base}:png`;
+      if (outFormat === "webp") return `${base}:webp:${quality}`;
+      return /\.jpe?g$/i.test(path) ? `${base}:jpg:${quality}:${chroma}` : `${base}:auto`;
+    },
+    [level, scale, removeBg, outFormat, quality, chroma],
   );
 
   const pending = useMemo(
@@ -569,6 +575,8 @@ export default function App() {
         removeBg,
         quality,
         device,
+        chroma,
+        format: outFormat,
       });
     } catch (error) {
       setNotice(String(error));
@@ -593,7 +601,7 @@ export default function App() {
           </div>
           <div className="min-w-0">
             <p className="text-[15px] font-semibold tracking-tight text-white">Upscaler</p>
-            <p className="truncate text-[11px] text-zinc-500">Escalado local · v1.2</p>
+            <p className="truncate text-[11px] text-zinc-500">Escalado local · v1.3</p>
           </div>
         </div>
 
@@ -741,7 +749,7 @@ export default function App() {
 
           <section>
             <p className="mb-2.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">
-              Calidad JPEG
+              Calidad
             </p>
             <div className="flex gap-1 rounded-xl border border-white/[0.06] bg-white/[0.02] p-1">
               {[80, 90, 95].map((value) => (
@@ -761,12 +769,73 @@ export default function App() {
               ))}
             </div>
             <p className="mt-2 text-[11px] leading-relaxed text-zinc-500">
-              Sólo afecta a la salida JPG; PNG y WebP no se recomprimen.
+              Se aplica a las salidas JPG y WebP. El PNG nunca se recomprime.
             </p>
-            {items.some((item) => /\.webp$/i.test(item.path)) && (
+
+            <p className="mb-2.5 mt-4 text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">
+              Color del JPG
+            </p>
+            <div className="flex gap-1 rounded-xl border border-white/[0.06] bg-white/[0.02] p-1">
+              {(
+                [
+                  { id: "420", label: "4:2:0" },
+                  { id: "444", label: "4:4:4" },
+                ] as const
+              ).map((option) => (
+                <button
+                  key={option.id}
+                  type="button"
+                  onClick={() => setChroma(option.id)}
+                  className={cx(
+                    "flex-1 rounded-lg py-1.5 text-[12px] font-medium transition",
+                    chroma === option.id
+                      ? "bg-white/[0.09] text-white shadow-sm"
+                      : "text-zinc-500 hover:text-zinc-300",
+                  )}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+            <p className="mt-2 text-[11px] leading-relaxed text-zinc-500">
+              4:2:0 es el submuestreo de las cámaras y pesa menos; 4:4:4 conserva todo el color.
+              Sólo afecta al JPG.
+            </p>
+
+            <p className="mb-2.5 mt-4 text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">
+              Formato de salida
+            </p>
+            <div className="flex gap-1 rounded-xl border border-white/[0.06] bg-white/[0.02] p-1">
+              {(
+                [
+                  { id: "auto", label: "Original" },
+                  { id: "webp", label: "WebP" },
+                ] as const
+              ).map((option) => (
+                <button
+                  key={option.id}
+                  type="button"
+                  onClick={() => setOutFormat(option.id)}
+                  className={cx(
+                    "flex-1 rounded-lg py-1.5 text-[12px] font-medium transition",
+                    outFormat === option.id
+                      ? "bg-white/[0.09] text-white shadow-sm"
+                      : "text-zinc-500 hover:text-zinc-300",
+                  )}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+            <p className="mt-2 text-[11px] leading-relaxed text-zinc-500">
+              WebP con pérdida mantiene la resolución y pesa bastante menos; conserva la
+              transparencia. Si quitas el fondo, la salida es PNG.
+            </p>
+
+            {outFormat === "auto" && items.some((item) => /\.webp$/i.test(item.path)) && (
               <p className="mt-2 rounded-lg border border-amber-400/20 bg-amber-500/[0.07] p-2 text-[10px] leading-relaxed text-amber-200/90">
-                Hay WebP en la cola: se guardan sin pérdida, así que el resultado puede pesar más
-                que el original.
+                Hay WebP en la cola: al mantener el formato original se guardan sin pérdida y
+                pueden pesar más. Elige «WebP» arriba para recomprimirlos con pérdida.
               </p>
             )}
           </section>

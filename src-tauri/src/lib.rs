@@ -161,7 +161,48 @@ fn add_paths(paths: Vec<String>) -> Vec<ImageMeta> {
     out
 }
 
-fn output_format(src: &Path) -> (&'static str, image::ImageFormat) {
+/// Submuestreo de color del JPEG. 4:4:4 guarda el color completo; 4:2:0 es el
+/// de las cámaras y pesa menos.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Chroma {
+    Full,
+    Sub420,
+}
+
+/// Formato del archivo final: el de la imagen original o WebP con pérdida.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Target {
+    Auto,
+    Webp,
+}
+
+#[derive(Clone, Copy)]
+pub struct Output {
+    quality: u8,
+    chroma: Chroma,
+    target: Target,
+}
+
+fn parse_chroma(value: Option<String>) -> Result<Chroma, String> {
+    match value.as_deref() {
+        None | Some("420") => Ok(Chroma::Sub420),
+        Some("444") => Ok(Chroma::Full),
+        Some(other) => Err(format!("Submuestreo de color desconocido: {other}")),
+    }
+}
+
+fn parse_target(value: Option<String>) -> Result<Target, String> {
+    match value.as_deref() {
+        None | Some("auto") => Ok(Target::Auto),
+        Some("webp") => Ok(Target::Webp),
+        Some(other) => Err(format!("Formato de salida desconocido: {other}")),
+    }
+}
+
+fn output_format(src: &Path, target: Target) -> (&'static str, image::ImageFormat) {
+    if target == Target::Webp {
+        return ("webp", image::ImageFormat::WebP);
+    }
     match src
         .extension()
         .and_then(|ext| ext.to_str())
@@ -238,7 +279,12 @@ fn open_oriented(path: &Path) -> Result<image::DynamicImage, String> {
 
 /// JPEG progresivo con tablas Huffman optimizadas: mismo aspecto y menos peso
 /// que el codificador baseline de `image`.
-fn write_jpeg(image: &image::DynamicImage, path: &Path, quality: u8) -> Result<(), String> {
+fn write_jpeg(
+    image: &image::DynamicImage,
+    path: &Path,
+    quality: u8,
+    chroma: Chroma,
+) -> Result<(), String> {
     let failed = || "No se pudo guardar la imagen resultante.".to_string();
     let converted;
     let rgb = match image {
@@ -258,12 +304,9 @@ fn write_jpeg(image: &image::DynamicImage, path: &Path, quality: u8) -> Result<(
         jpeg_encoder::Encoder::new_file(path, quality).map_err(|_| failed())?;
     encoder.set_progressive(true);
     encoder.set_optimized_huffman_tables(true);
-    // 4:2:0 es lo que usan las cámaras y ahorra ~11 % de peso a igual calidad;
-    // en calidad 95 se mantiene el color completo (4:4:4).
-    encoder.set_sampling_factor(if quality >= 95 {
-        jpeg_encoder::SamplingFactor::F_1_1
-    } else {
-        jpeg_encoder::SamplingFactor::F_2_2
+    encoder.set_sampling_factor(match chroma {
+        Chroma::Full => jpeg_encoder::SamplingFactor::F_1_1,
+        Chroma::Sub420 => jpeg_encoder::SamplingFactor::F_2_2,
     });
     encoder
         .encode(
@@ -273,6 +316,23 @@ fn write_jpeg(image: &image::DynamicImage, path: &Path, quality: u8) -> Result<(
             jpeg_encoder::ColorType::Rgb,
         )
         .map_err(|_| failed())
+}
+
+/// WebP con pérdida (libwebp). Mantiene la resolución y la transparencia, y
+/// suele pesar bastante menos que el JPEG o el PNG equivalentes.
+fn write_webp(image: &image::DynamicImage, path: &Path, quality: u8) -> Result<(), String> {
+    let converted;
+    let rgba = match image {
+        image::DynamicImage::ImageRgba8(buffer) => buffer,
+        other => {
+            converted = other.to_rgba8();
+            &converted
+        }
+    };
+    let encoder = webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height());
+    let memory = encoder.encode(quality as f32);
+    fs::write(path, &*memory)
+        .map_err(|_| "No se pudo guardar la imagen resultante.".to_string())
 }
 
 /// Recomprime un PNG sin pérdida (oxipng). Si el archivo es enorme o tarda
@@ -297,20 +357,24 @@ fn write_image(
     destination: &Path,
     ext: &str,
     format: image::ImageFormat,
-    quality: u8,
+    out: Output,
 ) -> Result<(), String> {
     let temporary = destination.with_extension(format!("{ext}.tmp"));
     let failed = || "No se pudo guardar la imagen resultante.".to_string();
     let prepared = prepare_for_format(image, format);
 
-    let saved = if format == image::ImageFormat::Jpeg {
-        write_jpeg(&prepared, &temporary, quality).is_ok()
-    } else {
-        let written = prepared.save_with_format(&temporary, format).is_ok();
-        if written && format == image::ImageFormat::Png {
-            optimize_png(&temporary);
+    let saved = match format {
+        image::ImageFormat::Jpeg => {
+            write_jpeg(&prepared, &temporary, out.quality, out.chroma).is_ok()
         }
-        written
+        image::ImageFormat::WebP => write_webp(&prepared, &temporary, out.quality).is_ok(),
+        _ => {
+            let written = prepared.save_with_format(&temporary, format).is_ok();
+            if written && format == image::ImageFormat::Png {
+                optimize_png(&temporary);
+            }
+            written
+        }
     };
 
     if !saved {
@@ -328,7 +392,7 @@ pub fn upscale_file(
     src: &Path,
     target_dir: &Path,
     scale: u32,
-    quality: u8,
+    out: Output,
     on_progress: &mut dyn FnMut(u8, &str),
 ) -> Result<PathBuf, String> {
     on_progress(10, "Leyendo");
@@ -357,9 +421,9 @@ pub fn upscale_file(
         .file_stem()
         .map(|stem| stem.to_string_lossy().to_string())
         .unwrap_or_else(|| "imagen".to_string());
-    let (ext, format) = output_format(src);
+    let (ext, format) = output_format(src, out.target);
     let destination = unique_output_path(target_dir, &stem, scale, ext);
-    write_image(resized, &destination, ext, format, quality)?;
+    write_image(resized, &destination, ext, format, out)?;
 
     on_progress(100, "Listo");
     Ok(destination)
@@ -388,12 +452,12 @@ fn too_big(width: u64, height: u64) -> String {
 fn run_simple_job(
     job: &JobRequest,
     scale: u32,
-    quality: u8,
+    out: Output,
     target: &Path,
     reporter: &Reporter,
 ) -> Result<PathBuf, String> {
     let src = PathBuf::from(&job.path);
-    upscale_file(&src, target, scale, quality, &mut |percent, stage| {
+    upscale_file(&src, target, scale, out, &mut |percent, stage| {
         reporter.progress(percent, stage)
     })
 }
@@ -413,7 +477,7 @@ fn ai_pipeline(
     job: &JobRequest,
     scale: u32,
     level: &str,
-    quality: u8,
+    out: Output,
     device: Option<i32>,
     target_dir: &Path,
     gpu: &sidecar::Gpu,
@@ -438,7 +502,7 @@ fn ai_pipeline(
         .file_stem()
         .map(|stem| stem.to_string_lossy().to_string())
         .unwrap_or_else(|| "imagen".to_string());
-    let (ext, format) = output_format(&src);
+    let (ext, format) = output_format(&src, out.target);
     let destination = unique_output_path(target_dir, &stem, scale, ext);
 
     let first = target_dir.join(format!(".{stem}-{}-ia.png", job.id));
@@ -525,7 +589,7 @@ fn ai_pipeline(
     };
 
     progress(92, "Guardando");
-    write_image(produced, &destination, ext, format, quality)?;
+    write_image(produced, &destination, ext, format, out)?;
 
     Ok(destination)
 }
@@ -576,7 +640,7 @@ fn run_ai_job(
     job: &JobRequest,
     scale: u32,
     level: &str,
-    quality: u8,
+    out: Output,
     device: Option<i32>,
     target: &Path,
 ) -> Result<PathBuf, String> {
@@ -584,7 +648,7 @@ fn run_ai_job(
         job,
         scale,
         level,
-        quality,
+        out,
         device,
         target,
         gpu,
@@ -657,6 +721,8 @@ fn start_batch(
     remove_bg: Option<bool>,
     quality: Option<u8>,
     device: Option<i32>,
+    chroma: Option<String>,
+    format: Option<String>,
 ) -> Result<(), String> {
     if jobs.is_empty() {
         return Err("La cola está vacía.".to_string());
@@ -678,7 +744,11 @@ fn start_batch(
         // sin elección explícita se usa la mejor tarjeta del equipo
         None => sidecar::best_device(&detect_gpus(&app)),
     };
-    let quality = quality.unwrap_or(DEFAULT_JPEG_QUALITY).clamp(1, 100);
+    let out = Output {
+        quality: quality.unwrap_or(DEFAULT_JPEG_QUALITY).clamp(1, 100),
+        chroma: parse_chroma(chroma)?,
+        target: parse_target(format)?,
+    };
     let target = workspace_dir(&app)?;
     let remove_bg = remove_bg.unwrap_or(false);
     app.state::<sidecar::Gpu>()
@@ -699,10 +769,10 @@ fn start_batch(
             }
             let started = Instant::now();
             let produced = if level == "simple" {
-                run_simple_job(&job, scale, quality, &target, &reporter)
+                run_simple_job(&job, scale, out, &target, &reporter)
             } else {
                 run_ai_job(
-                    &app_handle, &gpu, &reporter, &job, scale, &level, quality, device, &target,
+                    &app_handle, &gpu, &reporter, &job, scale, &level, out, device, &target,
                 )
             };
 
@@ -1106,6 +1176,18 @@ pub fn run() {
 mod tests {
     use super::*;
 
+    fn output_with(quality: u8) -> Output {
+        Output {
+            quality,
+            chroma: Chroma::Sub420,
+            target: Target::Auto,
+        }
+    }
+
+    fn output() -> Output {
+        output_with(DEFAULT_JPEG_QUALITY)
+    }
+
     fn sample(dir: &Path, name: &str, width: u32, height: u32) -> PathBuf {
         let _ = fs::remove_dir_all(dir);
         fs::create_dir_all(dir).unwrap();
@@ -1124,7 +1206,7 @@ mod tests {
         let src = sample(&dir, "entrada.png", 16, 12);
 
         let mut ticks = Vec::new();
-        let out = upscale_file(&src, &dir, 2, DEFAULT_JPEG_QUALITY, &mut |percent, _| {
+        let out = upscale_file(&src, &dir, 2, output(), &mut |percent, _| {
             ticks.push(percent)
         })
         .unwrap();
@@ -1139,7 +1221,7 @@ mod tests {
         let dir = std::env::temp_dir().join("img-upscaler-test-big");
         let src = sample(&dir, "grande.png", 6000, 4000);
 
-        let err = upscale_file(&src, &dir, 8, DEFAULT_JPEG_QUALITY, &mut |_, _| {}).unwrap_err();
+        let err = upscale_file(&src, &dir, 8, output(), &mut |_, _| {}).unwrap_err();
         assert!(err.contains("demasiado grande"));
     }
 
@@ -1222,7 +1304,7 @@ mod tests {
                 &job,
                 2,
                 level,
-                DEFAULT_JPEG_QUALITY,
+                output(),
                 None,
                 &dir,
                 &gpu,
@@ -1271,7 +1353,7 @@ mod tests {
                     &job,
                     2,
                     "potente",
-                    DEFAULT_JPEG_QUALITY,
+                    output(),
                     None,
                     &target,
                     &gpu,
@@ -1392,7 +1474,7 @@ mod tests {
             &job,
             8,
             "intermedio",
-            DEFAULT_JPEG_QUALITY,
+            output(),
             None,
             &dir,
             &sidecar::Gpu::default(),
@@ -1446,7 +1528,7 @@ mod tests {
                 &job,
                 2,
                 level,
-                DEFAULT_JPEG_QUALITY,
+                output(),
                 None,
                 Path::new(&out_dir),
                 &gpu,
@@ -1543,7 +1625,7 @@ mod tests {
             &high,
             "jpg",
             image::ImageFormat::Jpeg,
-            95,
+            output_with(95),
         )
         .unwrap();
         write_image(
@@ -1551,7 +1633,7 @@ mod tests {
             &low,
             "jpg",
             image::ImageFormat::Jpeg,
-            50,
+            output_with(50),
         )
         .unwrap();
 
@@ -1582,7 +1664,7 @@ mod tests {
             &target,
             "jpg",
             image::ImageFormat::Jpeg,
-            90,
+            output_with(90),
         )
         .unwrap();
 
@@ -1616,21 +1698,38 @@ mod tests {
             std::io::Write::flush(&mut writer).unwrap();
         }
         let progressive = dir.join("progresivo.jpg");
-        write_image(up.clone(), &progressive, "jpg", image::ImageFormat::Jpeg, 90).unwrap();
+        write_image(up.clone(), &progressive, "jpg", image::ImageFormat::Jpeg, output_with(90))
+            .unwrap();
 
 
         let raw_png = dir.join("sin-oxipng.png");
         up.save_with_format(&raw_png, image::ImageFormat::Png).unwrap();
         let optimized = dir.join("con-oxipng.png");
-        write_image(up.clone(), &optimized, "png", image::ImageFormat::Png, 90).unwrap();
+        write_image(up.clone(), &optimized, "png", image::ImageFormat::Png, output_with(90))
+            .unwrap();
+
+        let webp = dir.join("calidad-90.webp");
+        write_image(
+            up.clone(),
+            &webp,
+            "webp",
+            image::ImageFormat::WebP,
+            Output {
+                quality: 90,
+                chroma: Chroma::Sub420,
+                target: Target::Webp,
+            },
+        )
+        .unwrap();
 
         let alta = dir.join("calidad-95.jpg");
-        write_image(up, &alta, "jpg", image::ImageFormat::Jpeg, 95).unwrap();
+        write_image(up, &alta, "jpg", image::ImageFormat::Jpeg, output_with(95)).unwrap();
         println!("jpeg 95: {} bytes", fs::metadata(&alta).unwrap().len());
 
         for (label, a, b) in [
             ("jpeg", &baseline, &progressive),
             ("png", &raw_png, &optimized),
+            ("webp vs jpeg", &progressive, &webp),
         ] {
             let before = fs::metadata(a).unwrap().len();
             let after = fs::metadata(b).unwrap().len();
@@ -1656,13 +1755,102 @@ mod tests {
             &target,
             "png",
             image::ImageFormat::Png,
-            90,
+            output_with(90),
         )
         .unwrap();
 
         let decoded = image::open(&target).unwrap();
         assert_eq!((decoded.width(), decoded.height()), (64, 64));
         assert!(fs::metadata(&target).unwrap().len() > 0);
+    }
+
+    fn foto_cotidiana() -> image::RgbImage {
+        image::RgbImage::from_fn(200, 150, |x, y| {
+            image::Rgb([
+                ((x * 13 + y * 7) % 256) as u8,
+                ((x * 3 + y * 29) % 256) as u8,
+                ((x + y) * 5 % 256) as u8,
+            ])
+        })
+    }
+
+    #[test]
+    fn chroma_420_weighs_less_than_444() {
+        let dir = std::env::temp_dir().join("img-upscaler-chroma");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let full = dir.join("444.jpg");
+        let sub = dir.join("420.jpg");
+        write_image(
+            image::DynamicImage::ImageRgb8(foto_cotidiana()),
+            &full,
+            "jpg",
+            image::ImageFormat::Jpeg,
+            Output {
+                quality: 90,
+                chroma: Chroma::Full,
+                target: Target::Auto,
+            },
+        )
+        .unwrap();
+        write_image(
+            image::DynamicImage::ImageRgb8(foto_cotidiana()),
+            &sub,
+            "jpg",
+            image::ImageFormat::Jpeg,
+            Output {
+                quality: 90,
+                chroma: Chroma::Sub420,
+                target: Target::Auto,
+            },
+        )
+        .unwrap();
+
+        let full_size = fs::metadata(&full).unwrap().len();
+        let sub_size = fs::metadata(&sub).unwrap().len();
+        assert!(sub_size < full_size, "4:2:0 ({sub_size}) debería pesar menos que 4:4:4 ({full_size})");
+        assert_eq!(image::image_dimensions(&sub).unwrap(), (200, 150));
+    }
+
+    #[test]
+    fn webp_output_is_lossy_and_keeps_resolution() {
+        let dir = std::env::temp_dir().join("img-upscaler-webp");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let webp = dir.join("foto.webp");
+        write_image(
+            image::DynamicImage::ImageRgb8(foto_cotidiana()),
+            &webp,
+            "webp",
+            image::ImageFormat::WebP,
+            Output {
+                quality: 90,
+                chroma: Chroma::Sub420,
+                target: Target::Webp,
+            },
+        )
+        .unwrap();
+
+        let bytes = fs::read(&webp).unwrap();
+        assert_eq!(&bytes[..4], &b"RIFF"[..], "no es un contenedor RIFF");
+        assert_eq!(&bytes[8..12], &b"WEBP"[..], "no es un WebP");
+        // «VP8 » es el códec con pérdida; «VP8L» sería sin pérdida
+        assert_eq!(&bytes[12..16], &b"VP8 "[..], "debería estar comprimido con pérdida");
+        assert_eq!(image::image_dimensions(&webp).unwrap(), (200, 150));
+    }
+
+    #[test]
+    fn output_format_follows_the_request() {
+        let jpg = Path::new("foto.jpg");
+        assert_eq!(output_format(jpg, Target::Auto).0, "jpg");
+        assert_eq!(output_format(jpg, Target::Webp).0, "webp");
+        assert!(parse_target(Some("webp".to_string())).unwrap() == Target::Webp);
+        assert!(parse_target(None).unwrap() == Target::Auto);
+        assert!(parse_target(Some("avif".to_string())).is_err());
+        assert!(parse_chroma(Some("444".to_string())).unwrap() == Chroma::Full);
+        assert!(parse_chroma(None).unwrap() == Chroma::Sub420);
     }
 
     #[test]
