@@ -1,6 +1,7 @@
 mod bg;
 mod search;
 mod sidecar;
+mod store;
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -19,7 +20,7 @@ const MAX_OUTPUT_PIXELS: u64 = 120_000_000;
 const MAX_INTERMEDIATE_PIXELS: u64 = 320_000_000;
 const CANCELLED: &str = "CANCELLED";
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Debug)]
 pub struct ImageMeta {
     path: String,
     name: String,
@@ -42,9 +43,10 @@ struct JobProgress {
 }
 
 #[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct JobDone {
     id: String,
-    output: String,
+    result_id: String,
     width: u32,
     height: u32,
     ms: u64,
@@ -59,12 +61,6 @@ struct JobError {
 #[derive(Serialize, Clone)]
 struct JobCancelled {
     id: String,
-}
-
-#[derive(Serialize, Deserialize, Default, Clone)]
-#[serde(default, rename_all = "camelCase")]
-pub struct Settings {
-    out_dir: String,
 }
 
 /// Agrupa los eventos de un trabajo para no repetir el `emit` en cada rama.
@@ -85,14 +81,14 @@ impl Reporter<'_> {
         );
     }
 
-    fn done(&self, output: &Path, width: u32, height: u32, elapsed_ms: u128) {
+    fn done(&self, stored: &store::Stored, elapsed_ms: u128) {
         let _ = self.app.emit(
             "job:done",
             JobDone {
                 id: self.id.clone(),
-                output: output.to_string_lossy().to_string(),
-                width,
-                height,
+                result_id: stored.id.clone(),
+                width: stored.width,
+                height: stored.height,
                 ms: elapsed_ms as u64,
             },
         );
@@ -186,14 +182,16 @@ fn unique_output_path(dir: &Path, stem: &str, scale: u32, ext: &str) -> PathBuf 
     candidate
 }
 
-fn target_dir_for(src: &Path, out_dir: Option<&str>) -> PathBuf {
-    match out_dir {
-        Some(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
-        _ => src
-            .parent()
-            .map(|parent| parent.join("upscaled"))
-            .unwrap_or_else(|| PathBuf::from(".")),
-    }
+/// Carpeta de trabajo: el pipeline escribe ahí y la imagen se mueve a la
+/// biblioteca SQLite antes de borrar el temporal.
+fn workspace_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| "No se pudo localizar la carpeta de datos.".to_string())?
+        .join("trabajo");
+    fs::create_dir_all(&dir).map_err(|_| "No se pudo crear la carpeta de trabajo.".to_string())?;
+    Ok(dir)
 }
 
 /// JPEG no admite alfa: se compone sobre blanco antes de guardar.
@@ -298,12 +296,11 @@ fn too_big(width: u64, height: u64) -> String {
 fn run_simple_job(
     job: &JobRequest,
     scale: u32,
-    out_dir: Option<&str>,
+    target: &Path,
     reporter: &Reporter,
 ) -> Result<PathBuf, String> {
     let src = PathBuf::from(&job.path);
-    let target = target_dir_for(&src, out_dir);
-    upscale_file(&src, &target, scale, &mut |percent, stage| {
+    upscale_file(&src, target, scale, &mut |percent, stage| {
         reporter.progress(percent, stage)
     })
 }
@@ -315,7 +312,7 @@ fn ai_pipeline(
     job: &JobRequest,
     scale: u32,
     level: &str,
-    out_dir: Option<&str>,
+    target_dir: &Path,
     gpu: &sidecar::Gpu,
     exe: &Path,
     models: &Path,
@@ -333,8 +330,7 @@ fn ai_pipeline(
     let (out_w, out_h) = (width * scale, height * scale);
     check_limits(width, height, scale)?;
 
-    let target_dir = target_dir_for(&src, out_dir);
-    fs::create_dir_all(&target_dir)
+    fs::create_dir_all(target_dir)
         .map_err(|_| "No se pudo crear la carpeta de salida.".to_string())?;
 
     let stem = src
@@ -342,7 +338,7 @@ fn ai_pipeline(
         .map(|stem| stem.to_string_lossy().to_string())
         .unwrap_or_else(|| "imagen".to_string());
     let (ext, format) = output_format(&src);
-    let destination = unique_output_path(&target_dir, &stem, scale, ext);
+    let destination = unique_output_path(target_dir, &stem, scale, ext);
 
     let first = target_dir.join(format!(".{stem}-{}-ia.png", job.id));
     let engine_input = target_dir.join(format!(".{stem}-{}-entrada.png", job.id));
@@ -424,13 +420,13 @@ fn run_ai_job(
     job: &JobRequest,
     scale: u32,
     level: &str,
-    out_dir: Option<&str>,
+    target: &Path,
 ) -> Result<PathBuf, String> {
     ai_pipeline(
         job,
         scale,
         level,
-        out_dir,
+        target,
         gpu,
         &sidecar::exe(app),
         &sidecar::models_dir(app),
@@ -444,7 +440,6 @@ fn start_batch(
     jobs: Vec<JobRequest>,
     scale: u32,
     level: String,
-    out_dir: Option<String>,
     remove_bg: Option<bool>,
 ) -> Result<(), String> {
     if jobs.is_empty() {
@@ -456,6 +451,7 @@ fn start_batch(
     if !(2..=8).contains(&scale) {
         return Err("Factor de escala no válido.".to_string());
     }
+    let target = workspace_dir(&app)?;
     let remove_bg = remove_bg.unwrap_or(false);
     app.state::<sidecar::Gpu>()
         .cancel
@@ -475,9 +471,9 @@ fn start_batch(
             }
             let started = Instant::now();
             let produced = if level == "simple" {
-                run_simple_job(&job, scale, out_dir.as_deref(), &reporter)
+                run_simple_job(&job, scale, &target, &reporter)
             } else {
-                run_ai_job(&app_handle, &gpu, &reporter, &job, scale, &level, out_dir.as_deref())
+                run_ai_job(&app_handle, &gpu, &reporter, &job, scale, &level, &target)
             };
 
             match produced {
@@ -493,8 +489,17 @@ fn start_batch(
                     } else {
                         scaled
                     };
-                    let (width, height) = image::image_dimensions(&finished).unwrap_or((0, 0));
-                    reporter.done(&finished, width, height, started.elapsed().as_millis());
+                    let stored = match store::add(&app_handle, &finished, &level, scale) {
+                        Ok(stored) => stored,
+                        Err(message) => {
+                            reporter.failed(message);
+                            continue;
+                        }
+                    };
+                    // la biblioteca es la que guarda la imagen: el archivo de
+                    // trabajo ya no hace falta
+                    let _ = fs::remove_file(&finished);
+                    reporter.done(&stored, started.elapsed().as_millis());
                 }
                 Err(message) if message == CANCELLED => reporter.cancelled(),
                 Err(message) => reporter.failed(message),
@@ -521,34 +526,6 @@ fn kill_sidecar(gpu: &sidecar::Gpu) {
 #[tauri::command]
 fn cancel_batch(app: AppHandle) {
     kill_sidecar(&app.state::<sidecar::Gpu>());
-}
-
-fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
-    app.path()
-        .app_config_dir()
-        .map(|dir| dir.join("settings.json"))
-        .map_err(|_| "No se pudo localizar la carpeta de configuración.".to_string())
-}
-
-#[tauri::command]
-fn load_settings(app: AppHandle) -> Settings {
-    settings_path(&app)
-        .ok()
-        .and_then(|path| fs::read_to_string(path).ok())
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
-}
-
-#[tauri::command]
-fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
-    let path = settings_path(&app)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|_| "No se pudo crear la carpeta de configuración.".to_string())?;
-    }
-    let raw = serde_json::to_string_pretty(&settings)
-        .map_err(|_| "No se pudo preparar la configuración.".to_string())?;
-    fs::write(path, raw).map_err(|_| "No se pudieron guardar los ajustes.".to_string())
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -835,12 +812,38 @@ async fn download_image(
     store_download(&dir, &url, &bytes)
 }
 
+#[tauri::command]
+fn list_results(app: AppHandle) -> Result<Vec<store::Stored>, String> {
+    store::all(&app)
+}
+
+#[tauri::command]
+fn delete_result(app: AppHandle, id: String) -> Result<Vec<store::Stored>, String> {
+    store::remove(&app, &id)?;
+    store::all(&app)
+}
+
+#[tauri::command]
+fn copy_result(app: AppHandle, id: String) -> Result<(), String> {
+    store::copy(&app, &id)
+}
+
+#[tauri::command]
+fn export_result(app: AppHandle, id: String, path: String) -> Result<String, String> {
+    let destination = PathBuf::from(&path);
+    store::export(&app, &id, &destination)?;
+    Ok(destination.to_string_lossy().to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(sidecar::Gpu::default())
+        .register_uri_scheme_protocol(store::PROTOCOL, |ctx, request| {
+            store::serve(ctx.app_handle(), &request)
+        })
         .setup(|app| {
             // deja rastro de cómo se resolvieron binario y modelos
             if let Ok(dir) = app.path().app_data_dir() {
@@ -853,8 +856,10 @@ pub fn run() {
             add_paths,
             start_batch,
             cancel_batch,
-            load_settings,
-            save_settings,
+            list_results,
+            delete_result,
+            copy_result,
+            export_result,
             search_sources,
             save_source,
             search_images,
@@ -901,17 +906,6 @@ mod tests {
 
         let err = upscale_file(&src, &dir, 8, &mut |_, _| {}).unwrap_err();
         assert!(err.contains("demasiado grande"));
-    }
-
-    #[test]
-    fn settings_round_trip_uses_camel_case() {
-        let settings: Settings =
-            serde_json::from_str(r#"{"outDir":"C:\\fotos\\salida"}"#).unwrap();
-        assert_eq!(
-            serde_json::to_value(&settings).unwrap(),
-            serde_json::json!({ "outDir": "C:\\fotos\\salida" })
-        );
-        assert_eq!(Settings::default().out_dir, "");
     }
 
     #[test]
@@ -965,6 +959,46 @@ mod tests {
         assert!(dest_unc.is_file());
     }
 
+    /// Los dos niveles de IA llegan al tamaño pedido (el Simple ya está
+    /// cubierto por el test de Lanczos).
+    #[test]
+    fn both_ai_levels_reach_the_requested_size() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let exe = root.join("binaries/realesrgan-ncnn-vulkan.exe");
+        let models = root.join("models");
+        if !exe.is_file() {
+            return;
+        }
+
+        let dir = std::env::temp_dir().join("img-upscaler-niveles");
+        let src = sample(&dir, "entrada.png", 32, 24);
+        let job = JobRequest {
+            id: "niveles".to_string(),
+            path: src.to_string_lossy().to_string(),
+        };
+        let gpu = sidecar::Gpu::default();
+
+        for level in ["intermedio", "potente"] {
+            let output = ai_pipeline(
+                &job,
+                2,
+                level,
+                &dir,
+                &gpu,
+                &exe,
+                &models,
+                &mut |_, _| {},
+            )
+            .unwrap_or_else(|error| panic!("{level}: {error}"));
+            assert_eq!(
+                image::image_dimensions(&output).unwrap(),
+                (64, 48),
+                "nivel {level}"
+            );
+            let _ = fs::remove_file(output);
+        }
+    }
+
     #[test]
     fn cancel_kills_sidecar_and_leaves_no_temporaries() {
         use std::sync::Arc;
@@ -979,7 +1013,6 @@ mod tests {
 
         let dir = std::env::temp_dir().join("img-upscaler-cancel");
         let src = sample(&dir, "entrada.png", 1200, 900);
-        let out_dir = dir.to_string_lossy().to_string();
 
         let gpu = Arc::new(sidecar::Gpu::default());
         let worker = {
@@ -987,6 +1020,7 @@ mod tests {
             let src = src.clone();
             let exe = exe.clone();
             let models = models.clone();
+            let target = dir.clone();
             thread::spawn(move || {
                 let job = JobRequest {
                     id: "cancel-test".to_string(),
@@ -996,7 +1030,7 @@ mod tests {
                     &job,
                     2,
                     "potente",
-                    Some(&out_dir),
+                    &target,
                     &gpu,
                     &exe,
                     &models,
@@ -1045,7 +1079,6 @@ mod tests {
             query: "stone bridge".to_string(),
             page: 0,
             filters: search::Filters::default(),
-            sources: vec!["openverse".to_string(), "commons".to_string()],
         };
         let response = tauri::async_runtime::block_on(search::run(&request, &search::Keys::default()));
         println!(
@@ -1116,7 +1149,7 @@ mod tests {
             &job,
             8,
             "intermedio",
-            Some(&dir.to_string_lossy()),
+            &dir,
             &sidecar::Gpu::default(),
             &exe,
             &models,
@@ -1168,7 +1201,7 @@ mod tests {
                 &job,
                 2,
                 level,
-                Some(&out_dir),
+                Path::new(&out_dir),
                 &gpu,
                 &exe,
                 &models,

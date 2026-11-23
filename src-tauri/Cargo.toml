@@ -28,6 +28,8 @@ image = { version = "0.25", default-features = false, features = [
 ] }
 
 ort = "=2.0.0-rc.14"
+rusqlite = { version = "0.43", features = ["bundled"] }
+arboard = "3.6"
 
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart"] }
 futures = "0.3"

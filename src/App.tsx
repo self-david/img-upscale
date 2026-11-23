@@ -2,13 +2,20 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { open } from "@tauri-apps/plugin-dialog";
-import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
+import { ask, open, save } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
 
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
+/// Las imágenes guardadas en SQLite se sirven con el protocolo propio de Tauri.
+const APPIMG_BASE = /Windows/i.test(navigator.userAgent)
+  ? "http://appimg.localhost"
+  : "appimg://localhost";
+const resultSrc = (id: string, thumb = false) =>
+  isTauri ? `${APPIMG_BASE}/${thumb ? "thumb/" : ""}${id}` : "";
+
 type Level = "simple" | "intermedio" | "potente";
-type Section = "escalar" | "buscar";
+type Section = "escalar" | "resultados" | "buscar";
 
 const LEVELS: Array<{ id: Level; name: string; detail: string; time: string }> = [
   {
@@ -41,14 +48,28 @@ type Item = ImageMeta & {
   status: JobStatus;
   progress: number;
   stage: string;
-  output?: string;
+  /// Ajustes con los que se generó el resultado actual (nivel:factor:fondo).
+  recipe?: string;
+  resultId?: string;
   outWidth?: number;
   outHeight?: number;
   message?: string;
   ms?: number;
 };
 
-type Settings = { outDir: string };
+type StoredResult = {
+  id: string;
+  name: string;
+  format: string;
+  width: number;
+  height: number;
+  scale: number;
+  level: Level;
+  size: number;
+  createdAt: number;
+};
+
+const levelLabel = (id: string) => LEVELS.find((entry) => entry.id === id)?.name ?? id;
 
 type SearchHit = {
   id: string;
@@ -103,6 +124,9 @@ const ICONS = {
   globe: "M12 3a9 9 0 100 18 9 9 0 000-18zM3 12h18M12 3c2.5 2.6 3.8 5.7 3.8 9S14.5 18.4 12 21c-2.5-2.6-3.8-5.7-3.8-9S9.5 5.6 12 3z",
   layers: "M12 3l9 5-9 5-9-5 9-5zM3 13l9 5 9-5",
   compare: "M12 4v16M5 8l-3 4 3 4M19 8l3 4-3 4",
+  grid: "M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z",
+  copy: "M9 9h10v10H9zM15 9V5H5v10h4",
+  download: "M12 4v10M8 10l4 4 4-4M5 19h14",
 };
 
 function cx(...parts: Array<string | false | null | undefined>) {
@@ -165,7 +189,8 @@ export default function App() {
   const dropRef = useRef<((paths: string[]) => void) | null>(null);
   const sectionRef = useRef<Section>("escalar");
   sectionRef.current = section;
-  const [outDir, setOutDir] = useState("");
+  const [library, setLibrary] = useState<StoredResult[]>([]);
+  const [selectedResult, setSelectedResult] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [notice, setNotice] = useState("");
@@ -175,12 +200,6 @@ export default function App() {
     setItems((previous) =>
       previous.map((item) => (item.id === id ? { ...item, ...patch } : item)),
     );
-  }, []);
-
-  const rememberOutDir = useCallback((dir: string) => {
-    setOutDir(dir);
-    if (!isTauri) return;
-    void invoke("save_settings", { settings: { outDir: dir } }).catch(() => undefined);
   }, []);
 
   const addPaths = useCallback(async (paths: string[]) => {
@@ -212,12 +231,76 @@ export default function App() {
     }
   }, []);
 
-  useEffect(() => {
+  const refreshLibrary = useCallback(async () => {
     if (!isTauri) return;
-    void invoke<Settings>("load_settings")
-      .then((settings) => settings.outDir && setOutDir(settings.outDir))
-      .catch(() => undefined);
+    try {
+      setLibrary(await invoke<StoredResult[]>("list_results"));
+    } catch (error) {
+      setNotice(`No se pudo leer la biblioteca: ${String(error)}`);
+    }
   }, []);
+
+  useEffect(() => {
+    void refreshLibrary();
+  }, [refreshLibrary]);
+
+  const copyResult = useCallback(async (result: StoredResult) => {
+    try {
+      await invoke("copy_result", { id: result.id });
+      setNotice(`«${result.name}» copiada al portapapeles`);
+    } catch (error) {
+      setNotice(String(error));
+    }
+  }, []);
+
+  const downloadResult = useCallback(async (result: StoredResult) => {
+    try {
+      const extension = result.format === "jpg" ? "jpg" : result.format;
+      const target = await save({
+        title: "Guardar imagen",
+        defaultPath: result.name,
+        filters: [{ name: "Imagen", extensions: [extension] }],
+      });
+      if (!target) return;
+      await invoke("export_result", { id: result.id, path: target });
+      setNotice(`Guardada en ${target}`);
+    } catch (error) {
+      setNotice(String(error));
+    }
+  }, []);
+
+  const deleteResult = useCallback(
+    async (result: StoredResult) => {
+      try {
+        const sure = await ask(`¿Eliminar «${result.name}» de la biblioteca?`, {
+          title: "Eliminar imagen",
+          kind: "warning",
+          okLabel: "Eliminar",
+          cancelLabel: "Cancelar",
+        });
+        if (!sure) return;
+        setLibrary(await invoke<StoredResult[]>("delete_result", { id: result.id }));
+        setSelectedResult((current) => (current === result.id ? null : current));
+        setNotice("Imagen eliminada de la biblioteca.");
+      } catch (error) {
+        setNotice(String(error));
+      }
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (!isTauri || section !== "resultados" || !selectedResult) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "c") return;
+      const target = library.find((entry) => entry.id === selectedResult);
+      if (!target) return;
+      event.preventDefault();
+      void copyResult(target);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [section, selectedResult, library, copyResult]);
 
   useEffect(() => {
     if (!notice) return;
@@ -275,16 +358,12 @@ export default function App() {
     setSearchHint("");
     setSearching(true);
     try {
-      const response = await invoke<{ hits: SearchHit[] }>("reverse_image_search", { path });
+      const response = await invoke<{ hits: SearchHit[]; statuses: HitStatus[] }>(
+        "reverse_image_search",
+        { path },
+      );
       setHits(response.hits);
-      setHitStatuses([
-        {
-          id: "lens",
-          state: response.hits.length > 0 ? "ok" : "empty",
-          count: response.hits.length,
-          message: null,
-        },
-      ]);
+      setHitStatuses(response.statuses);
       setSearched(true);
       setSearchPage(0);
     } catch (error) {
@@ -334,26 +413,34 @@ export default function App() {
           stage: payload.stage,
         }),
       ),
-      listen<{ id: string; output: string; width: number; height: number; ms: number }>(
-        "job:done",
-        ({ payload }) =>
-          updateItem(payload.id, {
-            status: "done",
-            progress: 100,
-            stage: "Listo",
-            output: payload.output,
-            outWidth: payload.width,
-            outHeight: payload.height,
-            ms: payload.ms,
-          }),
-      ),
+      listen<{
+        id: string;
+        resultId: string;
+        width: number;
+        height: number;
+        ms: number;
+      }>("job:done", ({ payload }) => {
+        updateItem(payload.id, {
+          status: "done",
+          progress: 100,
+          stage: "Listo",
+          resultId: payload.resultId,
+          outWidth: payload.width,
+          outHeight: payload.height,
+          ms: payload.ms,
+        });
+        void refreshLibrary();
+      }),
       listen<{ id: string; message: string }>("job:error", ({ payload }) =>
         updateItem(payload.id, { status: "error", progress: 0, message: payload.message }),
       ),
       listen<{ id: string }>("job:cancelled", ({ payload }) =>
         updateItem(payload.id, { status: "cancelled", progress: 0, stage: "Cancelada" }),
       ),
-      listen("batch:done", () => setRunning(false)),
+      listen("batch:done", () => {
+        setRunning(false);
+        void refreshLibrary();
+      }),
     ]);
 
     const attach = async () => {
@@ -379,7 +466,7 @@ export default function App() {
       void subscriptions.then((unlisteners) => unlisteners.forEach((unlisten) => unlisten()));
       stopDrag?.();
     };
-  }, [addPaths, updateItem]);
+  }, [addPaths, refreshLibrary, updateItem]);
 
   const choose = async (options: Parameters<typeof open>[0]) => {
     try {
@@ -409,27 +496,24 @@ export default function App() {
     await addPaths(Array.isArray(selection) ? selection : [selection]);
   };
 
-  const pickOutDir = async () => {
-    const selection = await choose({
-      directory: true,
-      multiple: false,
-      title: "Carpeta de salida",
-    });
-    if (typeof selection === "string") rememberOutDir(selection);
-  };
+  /// Ajustes actuales: si cambian, las imágenes ya escaladas vuelven a la cola.
+  const recipe = `${level}:${scale}:${removeBg ? 1 : 0}`;
 
   const pending = useMemo(
     () =>
       items.filter(
         (item) =>
-          item.status === "pending" || item.status === "error" || item.status === "cancelled",
+          item.status === "pending" ||
+          item.status === "error" ||
+          item.status === "cancelled" ||
+          (item.status === "done" && item.recipe !== recipe),
       ),
-    [items],
+    [items, recipe],
   );
 
   const totalMp = items.reduce((sum, item) => sum + (item.width * item.height) / 1_000_000, 0);
   const completed = items.filter((item) => item.status === "done").length;
-  const hasResults = items.some((item) => item.output);
+  const libraryBytes = library.reduce((sum, result) => sum + result.size, 0);
 
   const start = async () => {
     if (pending.length === 0 || running) return;
@@ -438,7 +522,14 @@ export default function App() {
     setItems((previous) =>
       previous.map((item) =>
         ids.has(item.id)
-          ? { ...item, status: "pending", progress: 0, stage: "En cola", message: undefined }
+          ? {
+              ...item,
+              status: "pending",
+              progress: 0,
+              stage: "En cola",
+              message: undefined,
+              recipe,
+            }
           : item,
       ),
     );
@@ -447,7 +538,6 @@ export default function App() {
         jobs: pending.map((item) => ({ id: item.id, path: item.path })),
         scale,
         level,
-        outDir: outDir || null,
         removeBg,
       });
     } catch (error) {
@@ -459,16 +549,6 @@ export default function App() {
   const cancel = async () => {
     try {
       await invoke("cancel_batch");
-    } catch (error) {
-      setNotice(String(error));
-    }
-  };
-
-  const openResults = async () => {
-    const target = items.find((item) => item.output)?.output ?? items[0]?.path;
-    if (!target) return;
-    try {
-      await revealItemInDir(target);
     } catch (error) {
       setNotice(String(error));
     }
@@ -491,6 +571,7 @@ export default function App() {
           <div className="flex gap-1 rounded-xl border border-white/[0.06] bg-white/[0.02] p-1">
             {[
               { id: "escalar" as const, label: "Escalar", icon: ICONS.layers },
+              { id: "resultados" as const, label: "Resultados", icon: ICONS.grid },
               { id: "buscar" as const, label: "Buscar", icon: ICONS.search },
             ].map((option) => (
               <button
@@ -514,7 +595,7 @@ export default function App() {
         <div
           className={cx(
             "min-h-0 flex-1 space-y-6 overflow-y-auto px-6 pb-6",
-            section === "buscar" && "hidden",
+            section !== "escalar" && "hidden",
           )}
         >
           <section>
@@ -628,30 +709,10 @@ export default function App() {
             </button>
           </section>
 
-          <section>
-            <p className="mb-2.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">
-              Carpeta de salida
-            </p>
-            <button
-              type="button"
-              onClick={pickOutDir}
-              className="flex w-full items-center gap-2 rounded-xl border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-left text-[12px] text-zinc-300 transition hover:border-white/15 hover:bg-white/[0.04]"
-            >
-              <Icon d={ICONS.folder} className="h-4 w-4 shrink-0 text-zinc-500" />
-              <span className="min-w-0 flex-1 truncate">
-                {outDir || "Junto al original (carpeta «upscaled»)"}
-              </span>
-            </button>
-            {outDir && (
-              <button
-                type="button"
-                onClick={() => rememberOutDir("")}
-                className="mt-1.5 text-[11px] text-zinc-500 underline-offset-2 hover:text-zinc-300 hover:underline"
-              >
-                Volver a la carpeta del original
-              </button>
-            )}
-          </section>
+          <p className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-3 text-[11px] leading-relaxed text-zinc-500">
+            Los resultados se guardan en la biblioteca SQLite de la app. Desde «Resultados» puedes
+            copiarlos al portapapeles, guardarlos en el disco o eliminarlos.
+          </p>
         </div>
 
         <div
@@ -688,8 +749,39 @@ export default function App() {
 
         <div
           className={cx(
+            "min-h-0 flex-1 space-y-4 overflow-y-auto px-6 pb-6",
+            section !== "resultados" && "hidden",
+          )}
+        >
+          <section>
+            <p className="mb-2.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">
+              Biblioteca
+            </p>
+            <p className="text-[11px] leading-relaxed text-zinc-500">
+              Las imágenes escaladas se guardan en una base de datos SQLite dentro de la app. Desde
+              aquí puedes copiarlas al portapapeles, guardarlas en el disco o eliminarlas.
+            </p>
+            <dl className="mt-3 space-y-1.5 rounded-xl border border-white/[0.06] bg-white/[0.02] p-3 text-[11px]">
+              <div className="flex items-center justify-between">
+                <dt className="text-zinc-500">Imágenes</dt>
+                <dd className="text-zinc-200">{library.length}</dd>
+              </div>
+              <div className="flex items-center justify-between">
+                <dt className="text-zinc-500">Espacio</dt>
+                <dd className="text-zinc-200">{formatBytes(libraryBytes)}</dd>
+              </div>
+            </dl>
+          </section>
+          <p className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-3 text-[11px] leading-relaxed text-zinc-500">
+            Haz clic en una imagen para seleccionarla y pulsa <kbd className="rounded bg-white/[0.08] px-1 py-0.5 text-[10px] text-zinc-300">Ctrl</kbd>{" "}
+            + <kbd className="rounded bg-white/[0.08] px-1 py-0.5 text-[10px] text-zinc-300">C</kbd> para copiarla al portapapeles.
+          </p>
+        </div>
+
+        <div
+          className={cx(
             "border-t border-white/[0.06] px-6 py-5",
-            section === "buscar" && "hidden",
+            section !== "escalar" && "hidden",
           )}
         >
           {running ? (
@@ -754,6 +846,15 @@ export default function App() {
               setHitStatuses([]);
               setSearched(false);
             }}
+          />
+        ) : section === "resultados" ? (
+          <ResultsView
+            results={library}
+            selected={selectedResult}
+            onSelect={setSelectedResult}
+            onCopy={(result) => void copyResult(result)}
+            onDownload={(result) => void downloadResult(result)}
+            onDelete={(result) => void deleteResult(result)}
           />
         ) : (
           <>
@@ -830,6 +931,9 @@ export default function App() {
                 const chip = STATUS_CHIPS[item.status];
                 const outWidth = item.outWidth ?? item.width * scale;
                 const outHeight = item.outHeight ?? item.height * scale;
+                const stored = item.resultId
+                  ? library.find((entry) => entry.id === item.resultId)
+                  : undefined;
                 return (
                   <div
                     key={item.id}
@@ -837,13 +941,13 @@ export default function App() {
                   >
                     <div className="flex shrink-0 items-center gap-1.5">
                       <Preview
-                        path={item.path}
+                        src={isTauri ? convertFileSrc(item.path) : undefined}
                         label="antes"
-                        onClick={item.status === "done" ? () => setComparing(item) : undefined}
+                        onClick={item.resultId ? () => setComparing(item) : undefined}
                       />
-                      {item.output && (
+                      {item.resultId && (
                         <Preview
-                          path={item.output}
+                          src={resultSrc(item.resultId, true)}
                           label="después"
                           accent
                           onClick={() => setComparing(item)}
@@ -873,6 +977,12 @@ export default function App() {
                           : ""}
                       </p>
 
+                      {item.status === "done" && item.recipe !== recipe && (
+                        <p className="mt-1 text-[10px] text-amber-200/80">
+                          Ajustes cambiados: se volverá a escalar al procesar la tanda.
+                        </p>
+                      )}
+
                       {item.status === "running" && (
                         <div className="mt-2 flex items-center gap-2">
                           <div className="h-1 flex-1 overflow-hidden rounded-full bg-white/[0.08]">
@@ -896,15 +1006,25 @@ export default function App() {
                     </div>
 
                     <div className="flex shrink-0 items-center gap-1 opacity-0 transition group-hover:opacity-100 focus-within:opacity-100">
-                      {item.output && (
-                        <button
-                          type="button"
-                          title="Mostrar en el explorador"
-                          onClick={() => revealItemInDir(item.output as string)}
-                          className="grid h-7 w-7 place-items-center rounded-md text-zinc-500 transition hover:bg-white/[0.06] hover:text-zinc-200"
-                        >
-                          <Icon d={ICONS.folder} className="h-3.5 w-3.5" />
-                        </button>
+                      {stored && (
+                        <>
+                          <button
+                            type="button"
+                            title="Copiar al portapapeles"
+                            onClick={() => void copyResult(stored)}
+                            className="grid h-7 w-7 place-items-center rounded-md text-zinc-500 transition hover:bg-white/[0.06] hover:text-zinc-200"
+                          >
+                            <Icon d={ICONS.copy} className="h-3.5 w-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            title="Guardar una copia"
+                            onClick={() => void downloadResult(stored)}
+                            className="grid h-7 w-7 place-items-center rounded-md text-zinc-500 transition hover:bg-white/[0.06] hover:text-zinc-200"
+                          >
+                            <Icon d={ICONS.download} className="h-3.5 w-3.5" />
+                          </button>
+                        </>
                       )}
                       <button
                         type="button"
@@ -932,11 +1052,10 @@ export default function App() {
           </span>
           <button
             type="button"
-            onClick={openResults}
-            disabled={!hasResults}
-            className="rounded-md px-2 py-1 transition enabled:hover:bg-white/[0.06] enabled:hover:text-zinc-200 disabled:opacity-40"
+            onClick={() => setSection("resultados")}
+            className="rounded-md px-2 py-1 transition hover:bg-white/[0.06] hover:text-zinc-200"
           >
-            Abrir carpeta de resultados
+            Ver resultados{library.length > 0 ? ` (${library.length})` : ""}
           </button>
         </footer>
           </>
@@ -963,10 +1082,11 @@ export default function App() {
           </div>
         )}
 
-        {comparing?.output && (
+        {comparing?.resultId && (
           <Comparator
             item={comparing}
-            output={comparing.output}
+            outputSrc={resultSrc(comparing.resultId)}
+            originalSrc={isTauri ? convertFileSrc(comparing.path) : ""}
             onClose={() => setComparing(null)}
           />
         )}
@@ -1032,7 +1152,9 @@ function SearchView({
   visualQuery: string | null;
   onClearVisual: () => void;
 }) {
-  const label = (id: string) => sourceNames.find((source) => source.id === id)?.name ?? id;
+  const label = (id: string) =>
+    sourceNames.find((source) => source.id === id)?.name ??
+    (id === "lens" ? "Google Lens" : id);
 
   return (
     <>
@@ -1374,13 +1496,140 @@ function SourceRow({
   );
 }
 
+function ResultsView({
+  results,
+  selected,
+  onSelect,
+  onCopy,
+  onDownload,
+  onDelete,
+}: {
+  results: StoredResult[];
+  selected: string | null;
+  onSelect: (id: string) => void;
+  onCopy: (result: StoredResult) => void;
+  onDownload: (result: StoredResult) => void;
+  onDelete: (result: StoredResult) => void;
+}) {
+  const total = results.reduce((sum, result) => sum + result.size, 0);
+
+  return (
+    <>
+      <header className="flex items-center justify-between gap-4 border-b border-white/[0.06] px-8 py-5">
+        <div className="min-w-0">
+          <h1 className="text-[15px] font-semibold tracking-tight text-white">Resultados</h1>
+          <p className="truncate text-[11px] text-zinc-500">
+            {results.length === 0
+              ? "Todavía no has escalado ninguna imagen"
+              : `${results.length} ${results.length === 1 ? "imagen" : "imágenes"} · ${formatBytes(total)} en la biblioteca`}
+          </p>
+        </div>
+        <span className="shrink-0 rounded-full bg-white/[0.06] px-2.5 py-1 text-[10px] font-medium text-zinc-400">
+          SQLite
+        </span>
+      </header>
+
+      <div className="min-h-0 flex-1 overflow-y-auto px-8 py-6">
+        {results.length === 0 ? (
+          <div className="flex h-full min-h-[320px] flex-col items-center justify-center rounded-2xl border border-dashed border-white/[0.09] bg-white/[0.012] px-8 py-12 text-center">
+            <div className="grid h-14 w-14 place-items-center rounded-2xl border border-white/[0.08] bg-white/[0.03] text-zinc-400">
+              <Icon d={ICONS.grid} className="h-6 w-6" />
+            </div>
+            <p className="mt-5 text-[15px] font-medium text-zinc-100">Sin resultados guardados</p>
+            <p className="mt-1.5 max-w-sm text-[12px] leading-relaxed text-zinc-500">
+              Escala una tanda desde la pestaña «Escalar» y las imágenes aparecerán aquí, listas para
+              copiar, descargar o eliminar.
+            </p>
+          </div>
+        ) : (
+          <div className="grid grid-cols-2 gap-3 xl:grid-cols-3 2xl:grid-cols-4">
+            {results.map((result) => {
+              const active = selected === result.id;
+              return (
+                <article
+                  key={result.id}
+                  onClick={() => onSelect(result.id)}
+                  className={cx(
+                    "group cursor-pointer overflow-hidden rounded-xl border bg-white/[0.018] transition",
+                    active
+                      ? "border-indigo-400/60 ring-1 ring-indigo-400/30"
+                      : "border-white/[0.06] hover:border-white/[0.14]",
+                  )}
+                >
+                  <div className="relative aspect-[4/3] bg-[#05060a]">
+                    <img
+                      src={resultSrc(result.id, true)}
+                      alt={result.name}
+                      loading="lazy"
+                      draggable={false}
+                      className="h-full w-full object-contain"
+                    />
+                    <span className="absolute left-2 top-2 rounded-full bg-black/65 px-2 py-0.5 text-[10px] text-zinc-200">
+                      {levelLabel(result.level)} · {result.scale}×
+                    </span>
+                  </div>
+                  <div className="space-y-2 p-2.5">
+                    <p
+                      className="truncate text-[12px] font-medium text-zinc-200"
+                      title={result.name}
+                    >
+                      {result.name}
+                    </p>
+                    <p className="truncate text-[10px] text-zinc-500">
+                      {result.width}×{result.height} · {formatBytes(result.size)} ·{" "}
+                      {new Date(result.createdAt).toLocaleDateString("es-ES")}
+                    </p>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          onCopy(result);
+                        }}
+                        className="flex-1 rounded-lg bg-white/[0.06] px-2 py-1.5 text-[11px] font-medium text-zinc-200 transition hover:bg-white/[0.12]"
+                      >
+                        Copiar
+                      </button>
+                      <button
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          onDownload(result);
+                        }}
+                        className="flex-1 rounded-lg bg-white/[0.06] px-2 py-1.5 text-[11px] font-medium text-zinc-200 transition hover:bg-white/[0.12]"
+                      >
+                        Descargar
+                      </button>
+                      <button
+                        type="button"
+                        title="Eliminar de la biblioteca"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          onDelete(result);
+                        }}
+                        className="grid h-7 w-7 shrink-0 place-items-center rounded-lg text-zinc-500 transition hover:bg-rose-500/10 hover:text-rose-300"
+                      >
+                        <Icon d={ICONS.x} className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
 function Preview({
-  path,
+  src,
   label,
   accent = false,
   onClick,
 }: {
-  path: string;
+  src?: string;
   label: string;
   accent?: boolean;
   onClick?: () => void;
@@ -1397,9 +1646,9 @@ function Preview({
         onClick ? "cursor-zoom-in hover:ring-indigo-400/70" : "cursor-default",
       )}
     >
-      {isTauri ? (
+      {src ? (
         <img
-          src={convertFileSrc(path)}
+          src={src}
           alt={label}
           className="h-full w-full object-cover"
           draggable={false}
@@ -1418,11 +1667,13 @@ function Preview({
 
 function Comparator({
   item,
-  output,
+  outputSrc,
+  originalSrc,
   onClose,
 }: {
   item: Item;
-  output: string;
+  outputSrc: string;
+  originalSrc: string;
   onClose: () => void;
 }) {
   const [split, setSplit] = useState(50);
@@ -1514,7 +1765,7 @@ function Comparator({
               }
             >
               <img
-                src={convertFileSrc(item.path)}
+                src={originalSrc}
                 alt="Original"
                 draggable={false}
                 className={cx("absolute inset-0 h-full w-full", fitted && "object-contain")}
@@ -1524,7 +1775,7 @@ function Comparator({
                 style={{ clipPath: `inset(0 0 0 ${split}%)` }}
               >
                 <img
-                  src={convertFileSrc(output)}
+                  src={outputSrc}
                   alt="Resultado"
                   draggable={false}
                   className={cx("absolute inset-0 h-full w-full", fitted && "object-contain")}
