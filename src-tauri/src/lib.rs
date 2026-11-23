@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::atomic::Ordering,
+    sync::{atomic::Ordering, Mutex},
     thread,
     time::Instant,
 };
@@ -19,6 +19,9 @@ const MAX_OUTPUT_PIXELS: u64 = 120_000_000;
 /// tiene que caber en memoria.
 const MAX_INTERMEDIATE_PIXELS: u64 = 320_000_000;
 const CANCELLED: &str = "CANCELLED";
+/// El codificador JPEG de la librería usa 75 por defecto: para escalados eso
+/// tira calidad, así que la app guarda a 90 salvo que el usuario diga otra cosa.
+const DEFAULT_JPEG_QUALITY: u8 = 90;
 
 #[derive(Serialize, Clone, Debug)]
 pub struct ImageMeta {
@@ -215,17 +218,107 @@ fn prepare_for_format(mut image: image::DynamicImage, format: image::ImageFormat
     image
 }
 
+fn read_error() -> String {
+    "No se pudo leer la imagen: puede estar dañada o en un formato no soportado.".to_string()
+}
+
+/// Decodifica aplicando la orientación EXIF. Las fotos verticales de móvil
+/// guardan la rotación en los metadatos: sin esto se escalan tumbadas.
+fn open_oriented(path: &Path) -> Result<image::DynamicImage, String> {
+    let file = fs::File::open(path).map_err(|_| read_error())?;
+    let reader = image::ImageReader::new(std::io::BufReader::new(file))
+        .with_guessed_format()
+        .map_err(|_| read_error())?;
+    let mut decoder = reader.into_decoder().map_err(|_| read_error())?;
+    let orientation = image::ImageDecoder::orientation(&mut decoder).map_err(|_| read_error())?;
+    let mut image = image::DynamicImage::from_decoder(decoder).map_err(|_| read_error())?;
+    image.apply_orientation(orientation);
+    Ok(image)
+}
+
+/// JPEG progresivo con tablas Huffman optimizadas: mismo aspecto y menos peso
+/// que el codificador baseline de `image`.
+fn write_jpeg(image: &image::DynamicImage, path: &Path, quality: u8) -> Result<(), String> {
+    let failed = || "No se pudo guardar la imagen resultante.".to_string();
+    let converted;
+    let rgb = match image {
+        image::DynamicImage::ImageRgb8(buffer) => buffer,
+        other => {
+            converted = other.to_rgb8();
+            &converted
+        }
+    };
+    // el codificador progresivo trabaja con dimensiones de 16 bits
+    if rgb.width() > u16::MAX as u32 || rgb.height() > u16::MAX as u32 {
+        return image
+            .save_with_format(path, image::ImageFormat::Jpeg)
+            .map_err(|_| failed());
+    }
+    let mut encoder =
+        jpeg_encoder::Encoder::new_file(path, quality).map_err(|_| failed())?;
+    encoder.set_progressive(true);
+    encoder.set_optimized_huffman_tables(true);
+    // 4:2:0 es lo que usan las cámaras y ahorra ~11 % de peso a igual calidad;
+    // en calidad 95 se mantiene el color completo (4:4:4).
+    encoder.set_sampling_factor(if quality >= 95 {
+        jpeg_encoder::SamplingFactor::F_1_1
+    } else {
+        jpeg_encoder::SamplingFactor::F_2_2
+    });
+    encoder
+        .encode(
+            rgb.as_raw(),
+            rgb.width() as u16,
+            rgb.height() as u16,
+            jpeg_encoder::ColorType::Rgb,
+        )
+        .map_err(|_| failed())
+}
+
+/// Recomprime un PNG sin pérdida (oxipng). Si el archivo es enorme o tarda
+/// demasiado se queda como estaba: ahorrar peso no puede costar el archivo.
+fn optimize_png(path: &Path) {
+    let mut options = oxipng::Options::from_preset(2);
+    options.timeout = Some(std::time::Duration::from_secs(10));
+    options.max_decompressed_size = Some(200 * 1024 * 1024);
+    let Ok(original) = fs::read(path) else {
+        return;
+    };
+    let Ok(optimized) = oxipng::optimize_from_memory(&original, &options) else {
+        return;
+    };
+    if optimized.len() < original.len() && fs::write(path, &optimized).is_err() {
+        let _ = fs::write(path, &original);
+    }
+}
+
 fn write_image(
     image: image::DynamicImage,
     destination: &Path,
     ext: &str,
     format: image::ImageFormat,
+    quality: u8,
 ) -> Result<(), String> {
     let temporary = destination.with_extension(format!("{ext}.tmp"));
-    prepare_for_format(image, format)
-        .save_with_format(&temporary, format)
-        .map_err(|_| "No se pudo guardar la imagen resultante.".to_string())?;
+    let failed = || "No se pudo guardar la imagen resultante.".to_string();
+    let prepared = prepare_for_format(image, format);
+
+    let saved = if format == image::ImageFormat::Jpeg {
+        write_jpeg(&prepared, &temporary, quality).is_ok()
+    } else {
+        let written = prepared.save_with_format(&temporary, format).is_ok();
+        if written && format == image::ImageFormat::Png {
+            optimize_png(&temporary);
+        }
+        written
+    };
+
+    if !saved {
+        let _ = fs::remove_file(&temporary);
+        return Err(failed());
+    }
     fs::rename(&temporary, destination).map_err(|_| {
+        let _ = fs::remove_file(&temporary);
         "No se pudo finalizar el archivo; comprueba que la carpeta no esté en uso.".to_string()
     })
 }
@@ -235,12 +328,11 @@ pub fn upscale_file(
     src: &Path,
     target_dir: &Path,
     scale: u32,
+    quality: u8,
     on_progress: &mut dyn FnMut(u8, &str),
 ) -> Result<PathBuf, String> {
     on_progress(10, "Leyendo");
-    let image = image::open(src).map_err(|_| {
-        "No se pudo leer la imagen: puede estar dañada o en un formato no soportado.".to_string()
-    })?;
+    let image = open_oriented(src)?;
 
     let (out_w, out_h) = (
         image.width() as u64 * scale as u64,
@@ -267,7 +359,7 @@ pub fn upscale_file(
         .unwrap_or_else(|| "imagen".to_string());
     let (ext, format) = output_format(src);
     let destination = unique_output_path(target_dir, &stem, scale, ext);
-    write_image(resized, &destination, ext, format)?;
+    write_image(resized, &destination, ext, format, quality)?;
 
     on_progress(100, "Listo");
     Ok(destination)
@@ -296,13 +388,22 @@ fn too_big(width: u64, height: u64) -> String {
 fn run_simple_job(
     job: &JobRequest,
     scale: u32,
+    quality: u8,
     target: &Path,
     reporter: &Reporter,
 ) -> Result<PathBuf, String> {
     let src = PathBuf::from(&job.path);
-    upscale_file(&src, target, scale, &mut |percent, stage| {
+    upscale_file(&src, target, scale, quality, &mut |percent, stage| {
         reporter.progress(percent, stage)
     })
+}
+
+/// Intentos cuando el motor falla por memoria. El primero deja que elija el
+/// mosaico según la VRAM libre real; los siguientes lo bajan y reducen los
+/// hilos de carga/proceso/guardado, que también gastan memoria.
+/// `(mosaico, pocos hilos)`: mosaico 0 = automático.
+pub fn ai_attempts() -> Vec<(u32, bool)> {
+    vec![(0, false), (128, true), (64, true), (32, true)]
 }
 
 /// Pipeline de IA sin depender de la ventana: recibe rutas del motor y un
@@ -312,6 +413,8 @@ fn ai_pipeline(
     job: &JobRequest,
     scale: u32,
     level: &str,
+    quality: u8,
+    device: Option<i32>,
     target_dir: &Path,
     gpu: &sidecar::Gpu,
     exe: &Path,
@@ -323,9 +426,7 @@ fn ai_pipeline(
     // el motor abre la entrada con su propio decodificador: se le entrega un PNG
     // normalizado para que no dependa del formato ni del perfil de color original
     progress(3, "Preparando imagen");
-    let decoded = image::open(&src).map_err(|_| {
-        "No se pudo leer la imagen: puede estar dañada o en un formato no soportado.".to_string()
-    })?;
+    let decoded = open_oriented(&src)?;
     let (width, height) = (decoded.width(), decoded.height());
     let (out_w, out_h) = (width * scale, height * scale);
     check_limits(width, height, scale)?;
@@ -357,28 +458,59 @@ fn ai_pipeline(
         return Err("No se pudo preparar la imagen para el motor de IA.".to_string());
     }
 
-    let (model, tile) = if level == "intermedio" {
-        (sidecar::MODEL_INTERMEDIO, 128)
+    let model = if level == "intermedio" {
+        sidecar::MODEL_INTERMEDIO
     } else {
-        (sidecar::MODEL_POTENTE, 256)
+        sidecar::MODEL_POTENTE
     };
 
     progress(6, "Escalando con IA");
-    if let Err(message) = sidecar::run_with(
-        exe,
-        models,
-        gpu,
-        &sidecar::Job {
-            src: &engine_input,
-            dest: &first,
-            model,
-            scale: 4,
-            tile,
-        },
-        &mut |percent| progress(6 + (percent as u16 * 74 / 100) as u8, "Escalando con IA"),
-    ) {
+    let attempts = ai_attempts();
+    let mut last_error = String::new();
+    let mut scaled = false;
+    for (index, (tile, low_memory)) in attempts.iter().copied().enumerate() {
+        if index > 0 {
+            progress(6, &format!("Reintentando (mosaico {tile})"));
+        }
+        match sidecar::run_with(
+            exe,
+            models,
+            gpu,
+            &sidecar::Job {
+                src: &engine_input,
+                dest: &first,
+                model,
+                scale: 4,
+                tile,
+                device,
+                threads: if low_memory { Some("1:1:1") } else { None },
+            },
+            &mut |percent| progress(6 + (percent as u16 * 74 / 100) as u8, "Escalando con IA"),
+        ) {
+            Ok(_) => {
+                scaled = true;
+                break;
+            }
+            // cancelar o una instalación rota no mejoran con otro mosaico
+            Err(message) if message == CANCELLED || message.starts_with("No se encontró") => {
+                discard();
+                return Err(message);
+            }
+            Err(message) => {
+                let _ = fs::remove_file(&first);
+                last_error = message;
+            }
+        }
+    }
+    if !scaled {
         discard();
-        return Err(message);
+        return Err(if attempts.len() > 1 {
+            format!(
+                "{last_error} Se probó también con mosaicos más pequeños; si se repite, usa un factor menor o el nivel Simple."
+            )
+        } else {
+            last_error
+        });
     }
 
     progress(84, "Ajustando tamaño");
@@ -393,9 +525,33 @@ fn ai_pipeline(
     };
 
     progress(92, "Guardando");
-    write_image(produced, &destination, ext, format)?;
+    write_image(produced, &destination, ext, format, quality)?;
 
     Ok(destination)
+}
+
+/// La sesión de segmentación se carga una vez por proceso: crear una por
+/// imagen gastaba memoria y fallaba del segundo trabajo en adelante.
+#[derive(Default)]
+struct Segmenter(Mutex<Option<bg::Segmenter>>);
+
+impl Segmenter {
+    fn with<R>(&self, app: &AppHandle, run: impl FnOnce(&mut bg::Segmenter) -> R) -> Result<R, String> {
+        let mut guard = self
+            .0
+            .lock()
+            .map_err(|_| "El modelo de fondo quedó bloqueado.".to_string())?;
+        if guard.is_none() {
+            *guard = Some(bg::Segmenter::load(&sidecar::model_file(
+                app,
+                "u2netp.onnx",
+            ))?);
+        }
+        let segmenter = guard
+            .as_mut()
+            .ok_or_else(|| "No se pudo cargar el modelo de fondo.".to_string())?;
+        Ok(run(segmenter))
+    }
 }
 
 /// Paso final opcional: recorta el fondo del resultado ya escalado y se queda
@@ -405,10 +561,10 @@ fn cutout_result(app: &AppHandle, reporter: &Reporter, path: &Path) -> Result<Pa
     let image = image::open(path)
         .map_err(|error| format!("No se pudo leer el resultado para quitar el fondo ({error})."))?
         .to_rgb8();
-    let mut segmenter = bg::Segmenter::load(&sidecar::model_file(app, "u2netp.onnx"))?;
-    let mask = segmenter.mask(&image)?;
+    let mask = app.state::<Segmenter>().with(app, |model| model.mask(&image))??;
     let target = bg::output_path(path, path.parent().unwrap_or(Path::new(".")));
     bg::cutout(&image, &mask, &target)?;
+    optimize_png(&target);
     let _ = fs::remove_file(path);
     Ok(target)
 }
@@ -420,18 +576,76 @@ fn run_ai_job(
     job: &JobRequest,
     scale: u32,
     level: &str,
+    quality: u8,
+    device: Option<i32>,
     target: &Path,
 ) -> Result<PathBuf, String> {
     ai_pipeline(
         job,
         scale,
         level,
+        quality,
+        device,
         target,
         gpu,
         &sidecar::exe(app),
         &sidecar::models_dir(app),
         &mut |percent, stage| reporter.progress(percent, stage),
     )
+}
+
+/// GPUs detectadas; se sondean una sola vez por ejecución.
+#[derive(Default)]
+struct Gpus(Mutex<Option<Vec<sidecar::Device>>>);
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeviceInfo {
+    id: i32,
+    name: String,
+    best: bool,
+}
+
+fn probe_gpus(app: &AppHandle) -> Vec<sidecar::Device> {
+    let Ok(dir) = workspace_dir(app) else {
+        return Vec::new();
+    };
+    let probe = dir.join("sonda.png");
+    if !probe.is_file() {
+        let sample = image::RgbImage::from_fn(8, 8, |x, y| {
+            image::Rgb([(x * 30) as u8, (y * 30) as u8, 90])
+        });
+        let _ = sample.save(&probe);
+    }
+    sidecar::devices(&sidecar::exe(app), &sidecar::models_dir(app), &probe)
+}
+
+fn detect_gpus(app: &AppHandle) -> Vec<sidecar::Device> {
+    let state = app.state::<Gpus>();
+    if let Ok(cached) = state.0.lock() {
+        if let Some(list) = cached.as_ref() {
+            return list.clone();
+        }
+    }
+    let list = probe_gpus(app);
+    if let Ok(mut cached) = state.0.lock() {
+        *cached = Some(list.clone());
+    }
+    list
+}
+
+#[tauri::command]
+fn gpu_devices(app: AppHandle) -> Vec<DeviceInfo> {
+    let devices = detect_gpus(&app);
+    let best = sidecar::best_device(&devices);
+    devices
+        .into_iter()
+        .map(|device| DeviceInfo {
+            best: Some(device.index) == best,
+            id: device.index,
+            name: device.name,
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -441,6 +655,8 @@ fn start_batch(
     scale: u32,
     level: String,
     remove_bg: Option<bool>,
+    quality: Option<u8>,
+    device: Option<i32>,
 ) -> Result<(), String> {
     if jobs.is_empty() {
         return Err("La cola está vacía.".to_string());
@@ -451,6 +667,18 @@ fn start_batch(
     if !(2..=8).contains(&scale) {
         return Err("Factor de escala no válido.".to_string());
     }
+    let device = match device {
+        Some(value) => {
+            // el motor sólo acepta índices de GPU; no hay modo CPU
+            if !(0..=15).contains(&value) {
+                return Err("Dispositivo de escalado no válido.".to_string());
+            }
+            Some(value)
+        }
+        // sin elección explícita se usa la mejor tarjeta del equipo
+        None => sidecar::best_device(&detect_gpus(&app)),
+    };
+    let quality = quality.unwrap_or(DEFAULT_JPEG_QUALITY).clamp(1, 100);
     let target = workspace_dir(&app)?;
     let remove_bg = remove_bg.unwrap_or(false);
     app.state::<sidecar::Gpu>()
@@ -471,9 +699,11 @@ fn start_batch(
             }
             let started = Instant::now();
             let produced = if level == "simple" {
-                run_simple_job(&job, scale, &target, &reporter)
+                run_simple_job(&job, scale, quality, &target, &reporter)
             } else {
-                run_ai_job(&app_handle, &gpu, &reporter, &job, scale, &level, &target)
+                run_ai_job(
+                    &app_handle, &gpu, &reporter, &job, scale, &level, quality, device, &target,
+                )
             };
 
             match produced {
@@ -645,8 +875,7 @@ async fn search_images(app: AppHandle, request: search::SearchRequest) -> search
 
 /// La Image API de SerpAPI admite 500 KB: se reescala hasta que quepa.
 fn upload_bytes(path: &Path) -> Result<Vec<u8>, String> {
-    let image = image::open(path)
-        .map_err(|error| format!("No se pudo leer la imagen: {error}"))?;
+    let image = open_oriented(path).map_err(|error| format!("No se pudo leer la imagen: {error}"))?;
     for longest in [1024u32, 768, 512] {
         let scale = (longest as f32 / image.width().max(image.height()) as f32).min(1.0);
         let resized = image.resize(
@@ -841,6 +1070,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(sidecar::Gpu::default())
+        .manage(Gpus::default())
+        .manage(Segmenter::default())
         .register_uri_scheme_protocol(store::PROTOCOL, |ctx, request| {
             store::serve(ctx.app_handle(), &request)
         })
@@ -860,6 +1091,7 @@ pub fn run() {
             delete_result,
             copy_result,
             export_result,
+            gpu_devices,
             search_sources,
             save_source,
             search_images,
@@ -892,7 +1124,10 @@ mod tests {
         let src = sample(&dir, "entrada.png", 16, 12);
 
         let mut ticks = Vec::new();
-        let out = upscale_file(&src, &dir, 2, &mut |percent, _| ticks.push(percent)).unwrap();
+        let out = upscale_file(&src, &dir, 2, DEFAULT_JPEG_QUALITY, &mut |percent, _| {
+            ticks.push(percent)
+        })
+        .unwrap();
 
         assert_eq!(image::image_dimensions(&out).unwrap(), (32, 24));
         assert_eq!(out.file_name().unwrap().to_string_lossy(), "entrada_2x.png");
@@ -904,7 +1139,7 @@ mod tests {
         let dir = std::env::temp_dir().join("img-upscaler-test-big");
         let src = sample(&dir, "grande.png", 6000, 4000);
 
-        let err = upscale_file(&src, &dir, 8, &mut |_, _| {}).unwrap_err();
+        let err = upscale_file(&src, &dir, 8, DEFAULT_JPEG_QUALITY, &mut |_, _| {}).unwrap_err();
         assert!(err.contains("demasiado grande"));
     }
 
@@ -931,6 +1166,8 @@ mod tests {
                 model: sidecar::MODEL_INTERMEDIO,
                 scale: 4,
                 tile: 64,
+                device: None,
+                threads: None,
             },
             &mut |_| {},
         )
@@ -952,6 +1189,8 @@ mod tests {
                 model: sidecar::MODEL_INTERMEDIO,
                 scale: 4,
                 tile: 64,
+                device: None,
+                threads: None,
             },
             &mut |_| {},
         )
@@ -983,6 +1222,8 @@ mod tests {
                 &job,
                 2,
                 level,
+                DEFAULT_JPEG_QUALITY,
+                None,
                 &dir,
                 &gpu,
                 &exe,
@@ -1030,6 +1271,8 @@ mod tests {
                     &job,
                     2,
                     "potente",
+                    DEFAULT_JPEG_QUALITY,
+                    None,
                     &target,
                     &gpu,
                     &exe,
@@ -1149,6 +1392,8 @@ mod tests {
             &job,
             8,
             "intermedio",
+            DEFAULT_JPEG_QUALITY,
+            None,
             &dir,
             &sidecar::Gpu::default(),
             &exe,
@@ -1201,6 +1446,8 @@ mod tests {
                 &job,
                 2,
                 level,
+                DEFAULT_JPEG_QUALITY,
+                None,
                 Path::new(&out_dir),
                 &gpu,
                 &exe,
@@ -1229,5 +1476,210 @@ mod tests {
         assert_eq!(sidecar::parse_percent("0.00%\r25.00%\r"), Some(25));
         assert_eq!(sidecar::parse_percent("no hay nada"), None);
         assert_eq!(sidecar::parse_percent("150.00%"), Some(100));
+    }
+
+    /// Un JPEG con una única etiqueta EXIF (0x0112 Orientation) delante de los
+    /// datos del codificador, para comprobar que se aplica la rotación.
+    fn jpeg_with_orientation(dir: &Path, value: u16) -> PathBuf {
+        let mut buffer = Vec::new();
+        image::RgbImage::from_fn(40, 20, |x, y| image::Rgb([(x * 6) as u8, (y * 12) as u8, 70]))
+            .write_to(&mut std::io::Cursor::new(&mut buffer), image::ImageFormat::Jpeg)
+            .unwrap();
+
+        let mut payload: Vec<u8> = Vec::new();
+        payload.extend_from_slice(b"Exif\0\0");
+        payload.extend_from_slice(&[0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00]);
+        payload.extend_from_slice(&[0x01, 0x00]);
+        payload.extend_from_slice(&[0x12, 0x01, 0x03, 0x00]);
+        payload.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+        payload.extend_from_slice(&value.to_le_bytes());
+        payload.extend_from_slice(&[0x00, 0x00]);
+        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&buffer[..2]);
+        out.extend_from_slice(&[0xFF, 0xE1]);
+        out.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        out.extend_from_slice(&payload);
+        out.extend_from_slice(&buffer[2..]);
+
+        let path = dir.join(format!("orientacion-{value}.jpg"));
+        fs::write(&path, out).unwrap();
+        path
+    }
+
+    #[test]
+    fn applies_exif_orientation() {
+        let dir = std::env::temp_dir().join("img-upscaler-exif");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let normal = open_oriented(&jpeg_with_orientation(&dir, 1)).unwrap();
+        assert_eq!((normal.width(), normal.height()), (40, 20));
+
+        // 6 = girar 90° en sentido horario
+        let rotated = open_oriented(&jpeg_with_orientation(&dir, 6)).unwrap();
+        assert_eq!((rotated.width(), rotated.height()), (20, 40));
+    }
+
+    #[test]
+    fn jpeg_quality_changes_the_saved_file() {
+        let dir = std::env::temp_dir().join("img-upscaler-calidad");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let source = image::RgbImage::from_fn(180, 120, |x, y| {
+            image::Rgb([
+                ((x * 37 + y * 11) % 256) as u8,
+                ((x * 13 + y * 71) % 256) as u8,
+                ((x * 5 + y * 3) % 256) as u8,
+            ])
+        });
+
+        let high = dir.join("alta.jpg");
+        let low = dir.join("baja.jpg");
+        write_image(
+            image::DynamicImage::ImageRgb8(source.clone()),
+            &high,
+            "jpg",
+            image::ImageFormat::Jpeg,
+            95,
+        )
+        .unwrap();
+        write_image(
+            image::DynamicImage::ImageRgb8(source),
+            &low,
+            "jpg",
+            image::ImageFormat::Jpeg,
+            50,
+        )
+        .unwrap();
+
+        let high_size = fs::metadata(&high).unwrap().len();
+        let low_size = fs::metadata(&low).unwrap().len();
+        assert!(high_size > low_size, "calidad 95 ({high_size}) debería pesar más que 50 ({low_size})");
+        assert_eq!(image::image_dimensions(&high).unwrap(), (180, 120));
+        assert_eq!(image::image_dimensions(&low).unwrap(), (180, 120));
+    }
+
+    /// SOF2 (0xFFC2) es el marcador de un JPEG progresivo.
+    fn is_progressive_jpeg(bytes: &[u8]) -> bool {
+        bytes.windows(2).any(|pair| pair == [0xFF, 0xC2])
+    }
+
+    #[test]
+    fn jpeg_output_is_progressive_and_valid() {
+        let dir = std::env::temp_dir().join("img-upscaler-progresivo");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("foto.jpg");
+        let source = image::RgbImage::from_fn(120, 80, |x, y| {
+            image::Rgb([((x * 7) % 256) as u8, ((y * 11) % 256) as u8, 60])
+        });
+
+        write_image(
+            image::DynamicImage::ImageRgb8(source),
+            &target,
+            "jpg",
+            image::ImageFormat::Jpeg,
+            90,
+        )
+        .unwrap();
+
+        let bytes = fs::read(&target).unwrap();
+        assert!(is_progressive_jpeg(&bytes), "debería ser un JPEG progresivo");
+        assert_eq!(image::image_dimensions(&target).unwrap(), (120, 80));
+    }
+
+    #[test]
+    #[ignore]
+    fn mide_ahorro_real() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let dir = std::env::temp_dir().join("img-upscaler-ahorro");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let base = image::open(root.join("../samples/foto.jpg")).unwrap();
+        let up = base.resize_exact(
+            base.width() * 2,
+            base.height() * 2,
+            image::imageops::FilterType::Lanczos3,
+        );
+
+        // misma calidad (90) y mismas dimensiones: sólo cambia el codificador
+        let baseline = dir.join("baseline.jpg");
+        {
+            let file = fs::File::create(&baseline).unwrap();
+            let mut writer = std::io::BufWriter::new(file);
+            let mut encoder =
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut writer, 90);
+            encoder.encode_image(&up).unwrap();
+            std::io::Write::flush(&mut writer).unwrap();
+        }
+        let progressive = dir.join("progresivo.jpg");
+        write_image(up.clone(), &progressive, "jpg", image::ImageFormat::Jpeg, 90).unwrap();
+
+
+        let raw_png = dir.join("sin-oxipng.png");
+        up.save_with_format(&raw_png, image::ImageFormat::Png).unwrap();
+        let optimized = dir.join("con-oxipng.png");
+        write_image(up.clone(), &optimized, "png", image::ImageFormat::Png, 90).unwrap();
+
+        let alta = dir.join("calidad-95.jpg");
+        write_image(up, &alta, "jpg", image::ImageFormat::Jpeg, 95).unwrap();
+        println!("jpeg 95: {} bytes", fs::metadata(&alta).unwrap().len());
+
+        for (label, a, b) in [
+            ("jpeg", &baseline, &progressive),
+            ("png", &raw_png, &optimized),
+        ] {
+            let before = fs::metadata(a).unwrap().len();
+            let after = fs::metadata(b).unwrap().len();
+            println!(
+                "{label}: {before} -> {after} bytes ({:.1}% menos)",
+                (before as f64 - after as f64) / before as f64 * 100.0
+            );
+        }
+    }
+
+    #[test]
+    fn png_output_stays_valid_after_optimizing() {
+        let dir = std::env::temp_dir().join("img-upscaler-oxipng");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("icono.png");
+        let source = image::RgbaImage::from_fn(64, 64, |x, y| {
+            image::Rgba([(x * 3) as u8, (y * 3) as u8, 40, 255])
+        });
+
+        write_image(
+            image::DynamicImage::ImageRgba8(source),
+            &target,
+            "png",
+            image::ImageFormat::Png,
+            90,
+        )
+        .unwrap();
+
+        let decoded = image::open(&target).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (64, 64));
+        assert!(fs::metadata(&target).unwrap().len() > 0);
+    }
+
+    #[test]
+    fn retries_start_automatic_and_shrink() {
+        let attempts = ai_attempts();
+        assert_eq!(
+            attempts.first(),
+            Some(&(0, false)),
+            "el primer intento deja el mosaico al motor"
+        );
+        assert_eq!(
+            attempts.last().map(|(tile, low)| (*tile, *low)),
+            Some((32, true)),
+            "el último intento baja el mosaico y los hilos"
+        );
+        let tiles: Vec<u32> = attempts.iter().map(|(tile, _)| *tile).collect();
+        assert!(tiles.windows(2).all(|pair| pair[1] < pair[0] || pair[0] == 0));
+        assert!(attempts.iter().skip(1).all(|(_, low)| *low));
     }
 }

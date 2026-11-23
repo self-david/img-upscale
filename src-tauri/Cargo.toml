@@ -1,6 +1,6 @@
 [package]
 name = "img-upscaler"
-version = "0.1.0"
+version = "1.2.0"
 description = "Escalador de imágenes local"
 authors = ["david"]
 edition = "2021"
@@ -30,6 +30,8 @@ image = { version = "0.25", default-features = false, features = [
 ort = "=2.0.0-rc.14"
 rusqlite = { version = "0.43", features = ["bundled"] }
 arboard = "3.6"
+oxipng = { version = "10", default-features = false, features = ["parallel"] }
+jpeg-encoder = "0.6"
 
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart"] }
 futures = "0.3"

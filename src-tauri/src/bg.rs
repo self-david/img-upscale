@@ -1,6 +1,7 @@
 //! Quitar fondo con u2netp (ONNX) ejecutado en CPU, sin salir del equipo.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use image::imageops::FilterType;
 use image::{GrayImage, RgbImage, RgbaImage};
@@ -8,6 +9,23 @@ use ort::session::Session;
 use ort::value::Tensor;
 
 const SIZE: usize = 320;
+
+/// ONNX Runtime admite un único entorno por proceso: si se crea otro, la carga
+/// falla con «only one environment is allowed per process». Se crea una vez y
+/// todas las sesiones lo comparten.
+/// ONNX Runtime admite un único entorno por proceso: si se crea otro, la carga
+/// falla con «only one environment is allowed per process». Se crea una vez y
+/// todas las sesiones lo comparten.
+fn environment() -> Result<&'static ort::environment::Environment, String> {
+    static ENV: OnceLock<Result<ort::environment::Environment, String>> = OnceLock::new();
+    ENV.get_or_init(|| {
+        ort::init()
+            .build()
+            .map_err(|error| format!("No se pudo iniciar ONNX Runtime: {error}"))
+    })
+    .as_ref()
+    .map_err(|error| error.clone())
+}
 
 pub struct Segmenter {
     session: Session,
@@ -21,11 +39,8 @@ impl Segmenter {
                 path.display()
             ));
         }
-        let env =
-            ort::init()
-                .build()
-                .map_err(|error| format!("No se pudo iniciar ONNX Runtime: {error}"))?;
-        let session = Session::builder(&env)
+        let env = environment()?;
+        let session = Session::builder(env)
             .and_then(|mut builder| builder.commit_from_file(path))
             .map_err(|error| format!("No se pudo cargar el modelo de fondo: {error}"))?;
         Ok(Segmenter { session })
@@ -121,6 +136,28 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let scaled = dir.join("foto-2x.png");
         assert_eq!(output_path(&scaled, &dir), dir.join("foto-2x-sin-fondo.png"));
+    }
+
+    /// Diagnóstico: la app carga una sesión por imagen, así que esto reproduce
+    /// lo que pasa en una tanda con "Quitar el fondo" activado.
+    #[test]
+    fn loads_and_runs_more_than_once() {
+        let model = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/u2netp.onnx");
+        if !model.is_file() {
+            return;
+        }
+        for attempt in 0..3 {
+            let mut segmenter = Segmenter::load(&model)
+                .unwrap_or_else(|error| panic!("carga {attempt}: {error}"));
+            for (width, height) in [(64u32, 48u32), (1, 1), (640, 480)] {
+                let image = RgbImage::from_fn(width, height, |x, y| {
+                    image::Rgb([(x % 256) as u8, (y % 256) as u8, 90])
+                });
+                segmenter
+                    .mask(&image)
+                    .unwrap_or_else(|error| panic!("máscara {attempt} {width}x{height}: {error}"));
+            }
+        }
     }
 
     #[test]

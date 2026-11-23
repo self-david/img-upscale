@@ -33,6 +33,16 @@ const LEVELS: Array<{ id: Level; name: string; detail: string; time: string }> =
   { id: "potente", name: "Potente", detail: "IA general (x4plus) · máxima calidad", time: "10–25 s" },
 ];
 
+type GpuInfo = { id: number; name: string; best: boolean };
+
+/// «NVIDIA GeForce RTX 4060 Laptop GPU» → «RTX 4060 Laptop GPU» para que quepa.
+const shortGpu = (name: string) =>
+  name
+    .replace(/\((R|TM)\)/gi, "")
+    .replace(/\b(NVIDIA|GeForce|AMD|Radeon|Intel)\b/gi, "")
+    .replace(/\s+/g, " ")
+    .trim() || name;
+
 type JobStatus = "pending" | "running" | "done" | "error" | "cancelled";
 
 type ImageMeta = {
@@ -170,6 +180,9 @@ export default function App() {
   const [scale, setScale] = useState(2);
   const [level, setLevel] = useState<Level>("potente");
   const [removeBg, setRemoveBg] = useState(false);
+  const [quality, setQuality] = useState(90);
+  const [device, setDevice] = useState<number | null>(null);
+  const [gpus, setGpus] = useState<GpuInfo[]>([]);
   const [section, setSection] = useState<Section>("escalar");
   const [query, setQuery] = useState("");
   const [searchHint, setSearchHint] = useState("");
@@ -320,6 +333,13 @@ export default function App() {
   useEffect(() => {
     void refreshSources();
   }, [refreshSources]);
+
+  useEffect(() => {
+    if (!isTauri) return;
+    invoke<GpuInfo[]>("gpu_devices")
+      .then(setGpus)
+      .catch(() => undefined);
+  }, []);
 
   const runSearch = async (page = 0) => {
     const text = query.trim();
@@ -497,7 +517,15 @@ export default function App() {
   };
 
   /// Ajustes actuales: si cambian, las imágenes ya escaladas vuelven a la cola.
-  const recipe = `${level}:${scale}:${removeBg ? 1 : 0}`;
+  /// La calidad sólo cuenta cuando la salida es JPG: PNG y WebP no se
+  /// recomprimen, así que cambiarla no debe re-encolarlos.
+  const recipeFor = useCallback(
+    (path: string) =>
+      `${level}:${scale}:${removeBg ? 1 : 0}:${
+        !removeBg && /\.jpe?g$/i.test(path) ? quality : "sin-jpeg"
+      }`,
+    [level, scale, removeBg, quality],
+  );
 
   const pending = useMemo(
     () =>
@@ -506,9 +534,9 @@ export default function App() {
           item.status === "pending" ||
           item.status === "error" ||
           item.status === "cancelled" ||
-          (item.status === "done" && item.recipe !== recipe),
+          (item.status === "done" && item.recipe !== recipeFor(item.path)),
       ),
-    [items, recipe],
+    [items, recipeFor],
   );
 
   const totalMp = items.reduce((sum, item) => sum + (item.width * item.height) / 1_000_000, 0);
@@ -528,7 +556,7 @@ export default function App() {
               progress: 0,
               stage: "En cola",
               message: undefined,
-              recipe,
+              recipe: recipeFor(item.path),
             }
           : item,
       ),
@@ -539,6 +567,8 @@ export default function App() {
         scale,
         level,
         removeBg,
+        quality,
+        device,
       });
     } catch (error) {
       setNotice(String(error));
@@ -563,7 +593,7 @@ export default function App() {
           </div>
           <div className="min-w-0">
             <p className="text-[15px] font-semibold tracking-tight text-white">Upscaler</p>
-            <p className="truncate text-[11px] text-zinc-500">Escalado local · v0.3</p>
+            <p className="truncate text-[11px] text-zinc-500">Escalado local · v1.2</p>
           </div>
         </div>
 
@@ -707,6 +737,79 @@ export default function App() {
                 />
               </span>
             </button>
+          </section>
+
+          <section>
+            <p className="mb-2.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">
+              Calidad JPEG
+            </p>
+            <div className="flex gap-1 rounded-xl border border-white/[0.06] bg-white/[0.02] p-1">
+              {[80, 90, 95].map((value) => (
+                <button
+                  key={value}
+                  type="button"
+                  onClick={() => setQuality(value)}
+                  className={cx(
+                    "flex-1 rounded-lg py-1.5 text-[12px] font-medium transition",
+                    quality === value
+                      ? "bg-white/[0.09] text-white shadow-sm"
+                      : "text-zinc-500 hover:text-zinc-300",
+                  )}
+                >
+                  {value}
+                </button>
+              ))}
+            </div>
+            <p className="mt-2 text-[11px] leading-relaxed text-zinc-500">
+              Sólo afecta a la salida JPG; PNG y WebP no se recomprimen.
+            </p>
+            {items.some((item) => /\.webp$/i.test(item.path)) && (
+              <p className="mt-2 rounded-lg border border-amber-400/20 bg-amber-500/[0.07] p-2 text-[10px] leading-relaxed text-amber-200/90">
+                Hay WebP en la cola: se guardan sin pérdida, así que el resultado puede pesar más
+                que el original.
+              </p>
+            )}
+          </section>
+
+          <section>
+            <p className="mb-2.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">
+              Aceleración
+            </p>
+            <div className="flex gap-1 rounded-xl border border-white/[0.06] bg-white/[0.02] p-1">
+              <button
+                type="button"
+                onClick={() => setDevice(null)}
+                className={cx(
+                  "flex-1 rounded-lg py-1.5 text-[11px] font-medium transition",
+                  device === null
+                    ? "bg-white/[0.09] text-white shadow-sm"
+                    : "text-zinc-500 hover:text-zinc-300",
+                )}
+              >
+                Auto
+              </button>
+              {gpus.map((gpu) => (
+                <button
+                  key={gpu.id}
+                  type="button"
+                  title={gpu.name}
+                  onClick={() => setDevice(gpu.id)}
+                  className={cx(
+                    "min-w-0 flex-1 truncate rounded-lg px-1 py-1.5 text-[11px] font-medium transition",
+                    device === gpu.id
+                      ? "bg-white/[0.09] text-white shadow-sm"
+                      : "text-zinc-500 hover:text-zinc-300",
+                  )}
+                >
+                  {shortGpu(gpu.name)}
+                </button>
+              ))}
+            </div>
+            <p className="mt-2 text-[11px] leading-relaxed text-zinc-500">
+              {gpus.length > 0
+                ? `Auto usa ${gpus.find((gpu) => gpu.best)?.name ?? gpus[0].name} y ajusta el mosaico a su memoria.`
+                : "Auto elige la mejor tarjeta y ajusta el mosaico a su memoria."}
+            </p>
           </section>
 
           <p className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-3 text-[11px] leading-relaxed text-zinc-500">
@@ -926,7 +1029,7 @@ export default function App() {
               <p className="mt-6 text-[11px] text-zinc-600">JPG · PNG · WebP · BMP · TIFF</p>
             </div>
           ) : (
-            <div className="space-y-2">
+            <div className="grid grid-cols-2 gap-3 xl:grid-cols-3 2xl:grid-cols-4">
               {items.map((item) => {
                 const chip = STATUS_CHIPS[item.status];
                 const outWidth = item.outWidth ?? item.width * scale;
@@ -934,42 +1037,101 @@ export default function App() {
                 const stored = item.resultId
                   ? library.find((entry) => entry.id === item.resultId)
                   : undefined;
+                const stale = item.status === "done" && item.recipe !== recipeFor(item.path);
+                const thumb = item.resultId
+                  ? resultSrc(item.resultId, true)
+                  : isTauri
+                    ? convertFileSrc(item.path)
+                    : undefined;
                 return (
-                  <div
+                  <article
                     key={item.id}
-                    className="group flex items-center gap-4 rounded-xl border border-white/[0.06] bg-white/[0.018] p-3 transition hover:border-white/[0.12] hover:bg-white/[0.03]"
+                    title={item.resultId ? "Clic para comparar antes y después" : item.name}
+                    onClick={item.resultId ? () => setComparing(item) : undefined}
+                    className={cx(
+                      "group overflow-hidden rounded-xl border border-white/[0.06] bg-white/[0.018] transition hover:border-white/[0.12] hover:bg-white/[0.03]",
+                      item.resultId && "cursor-zoom-in",
+                    )}
                   >
-                    <div className="flex shrink-0 items-center gap-1.5">
-                      <Preview
-                        src={isTauri ? convertFileSrc(item.path) : undefined}
-                        label="antes"
-                        onClick={item.resultId ? () => setComparing(item) : undefined}
-                      />
-                      {item.resultId && (
-                        <Preview
-                          src={resultSrc(item.resultId, true)}
-                          label="después"
-                          accent
-                          onClick={() => setComparing(item)}
+                    <div className="relative aspect-[4/3] bg-[#05060a]">
+                      {thumb ? (
+                        <img
+                          src={thumb}
+                          alt={item.name}
+                          loading="lazy"
+                          draggable={false}
+                          className="h-full w-full object-contain"
                         />
+                      ) : (
+                        <div className="grid h-full w-full place-items-center text-zinc-600">
+                          <Icon d={ICONS.image} className="h-6 w-6" />
+                        </div>
                       )}
+
+                      <span
+                        className={cx(
+                          "absolute left-2 top-2 rounded-full px-2 py-0.5 text-[10px] font-medium tracking-wide",
+                          chip.className,
+                        )}
+                      >
+                        {chip.label}
+                      </span>
+
+                      {item.resultId && (
+                        <span className="absolute bottom-2 left-2 rounded-full bg-black/65 px-2 py-0.5 text-[10px] text-zinc-300 opacity-0 transition group-hover:opacity-100">
+                          Antes / después
+                        </span>
+                      )}
+
+                      <div className="absolute right-1.5 top-1.5 flex gap-1 opacity-0 transition group-hover:opacity-100 focus-within:opacity-100">
+                        {stored && (
+                          <>
+                            <button
+                              type="button"
+                              title="Copiar al portapapeles"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                void copyResult(stored);
+                              }}
+                              className="grid h-7 w-7 place-items-center rounded-md bg-black/65 text-zinc-300 transition hover:bg-black/85 hover:text-white"
+                            >
+                              <Icon d={ICONS.copy} className="h-3.5 w-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              title="Guardar una copia"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                void downloadResult(stored);
+                              }}
+                              className="grid h-7 w-7 place-items-center rounded-md bg-black/65 text-zinc-300 transition hover:bg-black/85 hover:text-white"
+                            >
+                              <Icon d={ICONS.download} className="h-3.5 w-3.5" />
+                            </button>
+                          </>
+                        )}
+                        <button
+                          type="button"
+                          title="Quitar de la cola"
+                          disabled={item.status === "running"}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setItems((previous) =>
+                              previous.filter((entry) => entry.id !== item.id),
+                            );
+                          }}
+                          className="grid h-7 w-7 place-items-center rounded-md bg-black/65 text-zinc-300 transition hover:bg-rose-500/80 hover:text-white disabled:opacity-30"
+                        >
+                          <Icon d={ICONS.x} className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
                     </div>
 
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-2">
-                        <p className="truncate text-[13px] font-medium text-zinc-100">
-                          {item.name}
-                        </p>
-                        <span
-                          className={cx(
-                            "shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium tracking-wide",
-                            chip.className,
-                          )}
-                        >
-                          {chip.label}
-                        </span>
-                      </div>
-                      <p className="mt-0.5 truncate text-[11px] text-zinc-500">
+                    <div className="space-y-1 p-2.5">
+                      <p className="truncate text-[12px] font-medium text-zinc-100" title={item.name}>
+                        {item.name}
+                      </p>
+                      <p className="truncate text-[10px] text-zinc-500">
                         {item.width}×{item.height} · {formatBytes(item.size)} → {outWidth}×
                         {outHeight}
                         {item.status === "done" && item.ms
@@ -977,68 +1139,35 @@ export default function App() {
                           : ""}
                       </p>
 
-                      {item.status === "done" && item.recipe !== recipe && (
-                        <p className="mt-1 text-[10px] text-amber-200/80">
-                          Ajustes cambiados: se volverá a escalar al procesar la tanda.
-                        </p>
-                      )}
-
                       {item.status === "running" && (
-                        <div className="mt-2 flex items-center gap-2">
+                        <div className="flex items-center gap-1.5 pt-0.5">
                           <div className="h-1 flex-1 overflow-hidden rounded-full bg-white/[0.08]">
                             <div
                               className="h-full rounded-full bg-gradient-to-r from-indigo-400 to-fuchsia-400 transition-[width] duration-300"
                               style={{ width: `${Math.max(4, item.progress)}%` }}
                             />
                           </div>
-                          <span className="w-16 shrink-0 text-right text-[10px] text-zinc-500">
-                            {item.stage}
-                          </span>
+                          <span className="shrink-0 text-[9px] text-zinc-500">{item.stage}</span>
                         </div>
                       )}
 
+                      {stale && (
+                        <p className="text-[10px] leading-snug text-amber-200/80">
+                          Ajustes cambiados: se volverá a escalar.
+                        </p>
+                      )}
+
                       {item.status === "error" && item.message && (
-                        <p className="mt-1.5 flex items-start gap-1.5 text-[11px] leading-relaxed text-rose-300/90">
+                        <p
+                          className="flex items-start gap-1.5 text-[10px] leading-snug text-rose-300/90"
+                          title={item.message}
+                        >
                           <Icon d={ICONS.alert} className="mt-0.5 h-3 w-3 shrink-0" />
-                          {item.message}
+                          <span className="line-clamp-3">{item.message}</span>
                         </p>
                       )}
                     </div>
-
-                    <div className="flex shrink-0 items-center gap-1 opacity-0 transition group-hover:opacity-100 focus-within:opacity-100">
-                      {stored && (
-                        <>
-                          <button
-                            type="button"
-                            title="Copiar al portapapeles"
-                            onClick={() => void copyResult(stored)}
-                            className="grid h-7 w-7 place-items-center rounded-md text-zinc-500 transition hover:bg-white/[0.06] hover:text-zinc-200"
-                          >
-                            <Icon d={ICONS.copy} className="h-3.5 w-3.5" />
-                          </button>
-                          <button
-                            type="button"
-                            title="Guardar una copia"
-                            onClick={() => void downloadResult(stored)}
-                            className="grid h-7 w-7 place-items-center rounded-md text-zinc-500 transition hover:bg-white/[0.06] hover:text-zinc-200"
-                          >
-                            <Icon d={ICONS.download} className="h-3.5 w-3.5" />
-                          </button>
-                        </>
-                      )}
-                      <button
-                        type="button"
-                        title="Quitar de la cola"
-                        disabled={item.status === "running"}
-                        onClick={() =>
-                          setItems((previous) => previous.filter((entry) => entry.id !== item.id))
-                        }
-                        className="grid h-7 w-7 place-items-center rounded-md text-zinc-500 transition hover:bg-white/[0.06] hover:text-rose-300 disabled:opacity-30"
-                      >
-                        <Icon d={ICONS.x} className="h-3.5 w-3.5" />
-                      </button>
-                    </div>
-                  </div>
+                  </article>
                 );
               })}
             </div>
@@ -1620,48 +1749,6 @@ function ResultsView({
         )}
       </div>
     </>
-  );
-}
-
-function Preview({
-  src,
-  label,
-  accent = false,
-  onClick,
-}: {
-  src?: string;
-  label: string;
-  accent?: boolean;
-  onClick?: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      disabled={!onClick}
-      title={onClick ? "Comparar antes y después" : label}
-      className={cx(
-        "relative h-12 w-16 shrink-0 overflow-hidden rounded-lg bg-black/40 ring-1 transition",
-        accent ? "ring-indigo-400/30" : "ring-white/[0.08]",
-        onClick ? "cursor-zoom-in hover:ring-indigo-400/70" : "cursor-default",
-      )}
-    >
-      {src ? (
-        <img
-          src={src}
-          alt={label}
-          className="h-full w-full object-cover"
-          draggable={false}
-        />
-      ) : (
-        <div className="grid h-full w-full place-items-center text-zinc-600">
-          <Icon d={ICONS.image} />
-        </div>
-      )}
-      <span className="absolute inset-x-0 bottom-0 bg-black/55 py-[1px] text-center text-[8px] uppercase tracking-wide text-zinc-300">
-        {label}
-      </span>
-    </button>
   );
 }
 

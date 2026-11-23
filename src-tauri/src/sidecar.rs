@@ -31,6 +31,93 @@ pub struct Job<'a> {
     pub model: &'a str,
     pub scale: u32,
     pub tile: u32,
+    /// `None` deja que Vulkan elija; `0..` fuerza una GPU concreta. Este motor
+    /// no admite CPU: `-g -1` responde «invalid gpu device».
+    pub device: Option<i32>,
+    /// Hilos `carga:proceso:guardado`. Menos hilos = menos memoria de GPU.
+    pub threads: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Device {
+    pub index: i32,
+    pub name: String,
+}
+
+/// GPUs que ve Vulkan, en el orden que usa `-g`. El motor imprime el nombre de
+/// cada una al arrancar; con un índice imposible termina al instante.
+/// `-t 0` deja que él mismo elija el mosaico según la memoria libre de la GPU.
+pub fn devices(exe: &Path, models: &Path, probe: &Path) -> Vec<Device> {
+    let mut command = Command::new(plain(exe));
+    command
+        .arg("-i")
+        .arg(plain(probe))
+        .arg("-o")
+        .arg(std::env::temp_dir().join("upscaler-sonda.png"))
+        .arg("-n")
+        .arg(MODEL_INTERMEDIO)
+        .arg("-m")
+        .arg(plain(models))
+        .arg("-g")
+        .arg("999")
+        .stdin(Stdio::null());
+    match command.output() {
+        Ok(output) => {
+            let text = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            parse_devices(&text)
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Cada GPU imprime varias líneas con el formato `[0 Intel(R) UHD Graphics] …`;
+/// basta la primera (la de las colas) para quedarse con índice y nombre.
+pub fn parse_devices(text: &str) -> Vec<Device> {
+    let mut devices: Vec<Device> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r').trim();
+        let Some(rest) = line.strip_prefix('[') else {
+            continue;
+        };
+        let Some((head, tail)) = rest.split_once(']') else {
+            continue;
+        };
+        if !tail.trim_start().starts_with("queue") {
+            continue;
+        }
+        let Some((index, name)) = head.split_once(' ') else {
+            continue;
+        };
+        let Ok(index) = index.trim().parse::<i32>() else {
+            continue;
+        };
+        let name = name.trim().to_string();
+        if !devices.iter().any(|device| device.index == index) {
+            devices.push(Device { index, name });
+        }
+    }
+    devices.sort_by_key(|device| device.index);
+    devices
+}
+
+/// Prefiere una GPU dedicada sobre la integrada: en portátiles híbridos es la
+/// diferencia entre usar la RTX y acabar en la Intel compartiendo RAM.
+pub fn best_device(devices: &[Device]) -> Option<i32> {
+    fn discrete(name: &str) -> bool {
+        let name = name.to_ascii_lowercase();
+        ["nvidia", "geforce", "rtx", "gtx", "radeon", "arc"]
+            .iter()
+            .any(|needle| name.contains(needle))
+    }
+    devices
+        .iter()
+        .find(|device| discrete(&device.name))
+        .or_else(|| devices.first())
+        .map(|device| device.index)
 }
 
 /// ncnn trata `\\?\C:\...` como ruta relativa y la cuelga del directorio del exe.
@@ -136,7 +223,8 @@ pub fn run_with(
         .try_clone()
         .map_err(|_| "No se pudo preparar la salida del motor.".to_string())?;
 
-    let mut child = Command::new(exe)
+    let mut command = Command::new(exe);
+    command
         .arg("-i")
         .arg(src)
         .arg("-o")
@@ -153,7 +241,14 @@ pub fn run_with(
         .arg("png")
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
+        .stderr(Stdio::from(stderr));
+    if let Some(device) = job.device {
+        command.arg("-g").arg(device.to_string());
+    }
+    if let Some(threads) = job.threads {
+        command.arg("-j").arg(threads);
+    }
+    let mut child = command
         .spawn()
         .map_err(|_| "No se pudo iniciar el motor de escalado con IA.".to_string())?;
 
@@ -240,6 +335,31 @@ pub fn last_message(payload: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_devices_from_engine_output() {
+        let text = "[0 Intel(R) UHD Graphics]  queueC=0[1]  queueG=0[1]\r\n\
+                    [1 NVIDIA GeForce RTX 4060]  queueC=1[2]  queueG=1[2]\r\n\
+                    [1 NVIDIA GeForce RTX 4060]  subgroup=32  basic=1\r\n\
+                    invalid gpu device\r\n";
+        let devices = parse_devices(text);
+        assert_eq!(
+            devices,
+            vec![
+                Device {
+                    index: 0,
+                    name: "Intel(R) UHD Graphics".to_string()
+                },
+                Device {
+                    index: 1,
+                    name: "NVIDIA GeForce RTX 4060".to_string()
+                },
+            ]
+        );
+        assert_eq!(best_device(&devices), Some(1), "debe preferir la dedicada");
+        assert_eq!(best_device(&devices[..1]), Some(0));
+        assert_eq!(best_device(&[]), None);
+    }
 
     #[test]
     fn strips_windows_extended_prefix() {
