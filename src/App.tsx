@@ -4,6 +4,9 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { ask, open, save } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { getVersion } from "@tauri-apps/api/app";
+import { check, type Update } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -46,6 +49,28 @@ const shortGpu = (name: string) =>
     .trim() || name;
 
 type JobStatus = "pending" | "running" | "done" | "error" | "cancelled";
+
+/// Lo que se guarda entre arranques: ajustes y cola.
+type SavedSettings = {
+  level?: Level;
+  scale?: number;
+  removeBg?: boolean;
+  quality?: number;
+  chroma?: Chroma;
+  format?: OutFormat;
+  device?: number | null;
+};
+type SavedQueueItem = {
+  id: string;
+  path: string;
+  name: string;
+  width: number;
+  height: number;
+  size: number;
+  status: JobStatus;
+  resultId?: string | null;
+};
+type Session = { settings: SavedSettings; queue: SavedQueueItem[] };
 
 type ImageMeta = {
   path: string;
@@ -212,6 +237,15 @@ export default function App() {
   const [dragging, setDragging] = useState(false);
   const [notice, setNotice] = useState("");
   const [comparing, setComparing] = useState<Item | null>(null);
+  const [appVersion, setAppVersion] = useState("1.4");
+  const [sessionReady, setSessionReady] = useState(!isTauri);
+  const [updateState, setUpdateState] = useState<
+    "idle" | "checking" | "current" | "available" | "downloading" | "error"
+  >("idle");
+  const [updateVersion, setUpdateVersion] = useState("");
+  const [updateProgress, setUpdateProgress] = useState(0);
+  const updateRef = useRef<Update | null>(null);
+  const savedSession = useRef("");
 
   const updateItem = useCallback((id: string, patch: Partial<Item>) => {
     setItems((previous) =>
@@ -260,6 +294,77 @@ export default function App() {
   useEffect(() => {
     void refreshLibrary();
   }, [refreshLibrary]);
+
+  // versión real del bundle y sesión guardada (ajustes + cola) al arrancar
+  useEffect(() => {
+    if (!isTauri) return;
+    void getVersion()
+      .then(setAppVersion)
+      .catch(() => undefined);
+    let cancelled = false;
+    void (async () => {
+      try {
+        const session = await invoke<Session>("load_session");
+        if (cancelled) return;
+        const saved = session.settings ?? {};
+        if (saved.level) setLevel(saved.level);
+        if (saved.scale) setScale(saved.scale);
+        if (typeof saved.removeBg === "boolean") setRemoveBg(saved.removeBg);
+        if (saved.quality) setQuality(saved.quality);
+        if (saved.chroma) setChroma(saved.chroma);
+        if (saved.format) setOutFormat(saved.format);
+        if (typeof saved.device === "number") setDevice(saved.device);
+        const restored: Item[] = (session.queue ?? []).map((entry) => ({
+          id: entry.id,
+          path: entry.path,
+          name: entry.name,
+          width: entry.width,
+          height: entry.height,
+          size: entry.size,
+          status: entry.status === "done" ? "done" : "pending",
+          progress: entry.status === "done" ? 100 : 0,
+          stage: entry.status === "done" ? "Listo" : "En espera",
+          resultId: entry.resultId ?? undefined,
+        }));
+        if (restored.length > 0) setItems((previous) => (previous.length > 0 ? previous : restored));
+        // sólo se empieza a guardar si la sesión anterior se pudo leer: si no,
+        // guardar los valores por defecto borraría la cola del usuario
+        if (!cancelled) setSessionReady(true);
+      } catch (error) {
+        setNotice(`No se pudo recuperar la sesión anterior: ${String(error)}`);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // guarda ajustes y cola para poder reanudar tras cerrar la app
+  useEffect(() => {
+    if (!isTauri || !sessionReady) return;
+    const payload = {
+      settings: { level, scale, removeBg, quality, chroma, format: outFormat, device },
+      queue: items.map((item) => ({
+        id: item.id,
+        path: item.path,
+        name: item.name,
+        width: item.width,
+        height: item.height,
+        size: item.size,
+        status: item.status,
+        resultId: item.resultId ?? null,
+      })),
+    };
+    const raw = JSON.stringify(payload);
+    if (raw === savedSession.current) return;
+    const timer = window.setTimeout(() => {
+      savedSession.current = raw;
+      void invoke("save_session", payload).catch((error) =>
+        setNotice(`No se pudo guardar la sesión: ${String(error)}`),
+      );
+    }, 600);
+    return () => window.clearTimeout(timer);
+  }, [items, level, scale, removeBg, quality, chroma, outFormat, device, sessionReady]);
 
   const copyResult = useCallback(async (result: StoredResult) => {
     try {
@@ -592,6 +697,71 @@ export default function App() {
     }
   };
 
+  const checkUpdates = useCallback(async () => {
+    setUpdateState("checking");
+    try {
+      const found = await check();
+      if (!found) {
+        updateRef.current = null;
+        setUpdateState("current");
+        return;
+      }
+      updateRef.current = found;
+      setUpdateVersion(found.version);
+      setUpdateState("available");
+    } catch (error) {
+      setUpdateState("error");
+      setNotice(`No se pudo comprobar la actualización: ${String(error)}`);
+    }
+  }, []);
+
+  const installUpdate = useCallback(async () => {
+    const found = updateRef.current;
+    if (!found) return;
+    setUpdateState("downloading");
+    setUpdateProgress(0);
+    let total = 0;
+    let received = 0;
+    try {
+      await found.downloadAndInstall((event) => {
+        if (event.event === "Started") {
+          total = event.data.contentLength ?? 0;
+        } else if (event.event === "Progress") {
+          received += event.data.chunkLength;
+          setUpdateProgress(total > 0 ? Math.min(100, Math.round((received / total) * 100)) : 0);
+        }
+      });
+      await relaunch();
+    } catch (error) {
+      setUpdateState("error");
+      setNotice(`No se pudo instalar la actualización: ${String(error)}`);
+    }
+  }, []);
+
+  const exportAll = useCallback(async () => {
+    if (library.length === 0) return;
+    let folder: string | null = null;
+    try {
+      const picked = await open({ directory: true, multiple: false, title: "Elige la carpeta de destino" });
+      folder = typeof picked === "string" ? picked : null;
+    } catch (error) {
+      setNotice(String(error));
+      return;
+    }
+    if (!folder) return;
+    try {
+      const count = await invoke<number>("export_results", {
+        ids: library.map((entry) => entry.id),
+        folder,
+      });
+      setNotice(
+        `${count} ${count === 1 ? "imagen guardada" : "imágenes guardadas"} en ${folder}`,
+      );
+    } catch (error) {
+      setNotice(String(error));
+    }
+  }, [library]);
+
   return (
     <div className="flex h-full min-h-0 w-full overflow-hidden bg-[#08090d] text-zinc-200">
       <aside className="flex w-[338px] shrink-0 flex-col border-r border-white/[0.06] bg-[#0b0d13]">
@@ -601,7 +771,7 @@ export default function App() {
           </div>
           <div className="min-w-0">
             <p className="text-[15px] font-semibold tracking-tight text-white">Upscaler</p>
-            <p className="truncate text-[11px] text-zinc-500">Escalado local · v1.3</p>
+            <p className="truncate text-[11px] text-zinc-500">Escalado local · v{appVersion}</p>
           </div>
         </div>
 
@@ -628,6 +798,39 @@ export default function App() {
               </button>
             ))}
           </div>
+        </div>
+
+        <div className="px-6 pb-4">
+          <div className="flex items-center justify-between gap-2">
+            <button
+              type="button"
+              onClick={() => void checkUpdates()}
+              disabled={updateState === "checking" || updateState === "downloading"}
+              className="rounded-lg border border-white/[0.07] bg-white/[0.03] px-2 py-1 text-[10px] font-medium text-zinc-400 transition hover:border-white/[0.14] hover:text-zinc-200 disabled:opacity-50"
+            >
+              {updateState === "checking" ? "Buscando…" : "Buscar actualizaciones"}
+            </button>
+            <span className="truncate text-[10px] text-zinc-600">
+              {updateState === "current"
+                ? "Al día"
+                : updateState === "error"
+                  ? "Sin respuesta"
+                  : updateState === "available"
+                    ? `v${updateVersion}`
+                    : updateState === "downloading"
+                      ? `Descargando ${updateProgress}%`
+                      : ""}
+            </span>
+          </div>
+          {updateState === "available" && (
+            <button
+              type="button"
+              onClick={() => void installUpdate()}
+              className="mt-2 w-full rounded-lg bg-indigo-500 px-3 py-1.5 text-[11px] font-semibold text-white transition hover:bg-indigo-400"
+            >
+              Instalar v{updateVersion} y reiniciar
+            </button>
+          )}
         </div>
 
         <div
@@ -930,8 +1133,8 @@ export default function App() {
               Biblioteca
             </p>
             <p className="text-[11px] leading-relaxed text-zinc-500">
-              Las imágenes escaladas se guardan en una base de datos SQLite dentro de la app. Desde
-              aquí puedes copiarlas al portapapeles, guardarlas en el disco o eliminarlas.
+              Las imágenes escaladas se guardan en la biblioteca de la app, en tu disco. Desde aquí
+              puedes copiarlas al portapapeles, guardarlas en una carpeta o eliminarlas.
             </p>
             <dl className="mt-3 space-y-1.5 rounded-xl border border-white/[0.06] bg-white/[0.02] p-3 text-[11px]">
               <div className="flex items-center justify-between">
@@ -1027,6 +1230,7 @@ export default function App() {
             onCopy={(result) => void copyResult(result)}
             onDownload={(result) => void downloadResult(result)}
             onDelete={(result) => void deleteResult(result)}
+            onExportAll={() => void exportAll()}
           />
         ) : (
           <>
@@ -1701,6 +1905,7 @@ function ResultsView({
   onCopy,
   onDownload,
   onDelete,
+  onExportAll,
 }: {
   results: StoredResult[];
   selected: string | null;
@@ -1708,6 +1913,7 @@ function ResultsView({
   onCopy: (result: StoredResult) => void;
   onDownload: (result: StoredResult) => void;
   onDelete: (result: StoredResult) => void;
+  onExportAll: () => void;
 }) {
   const total = results.reduce((sum, result) => sum + result.size, 0);
 
@@ -1722,9 +1928,19 @@ function ResultsView({
               : `${results.length} ${results.length === 1 ? "imagen" : "imágenes"} · ${formatBytes(total)} en la biblioteca`}
           </p>
         </div>
-        <span className="shrink-0 rounded-full bg-white/[0.06] px-2.5 py-1 text-[10px] font-medium text-zinc-400">
-          SQLite
-        </span>
+        <div className="flex shrink-0 items-center gap-2">
+          <button
+            type="button"
+            onClick={onExportAll}
+            disabled={results.length === 0}
+            className="rounded-lg border border-white/[0.08] bg-white/[0.04] px-3 py-1.5 text-[11px] font-medium text-zinc-200 transition hover:bg-white/[0.10] disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            Guardar todas
+          </button>
+          <span className="rounded-full bg-white/[0.06] px-2.5 py-1 text-[10px] font-medium text-zinc-400">
+            En disco
+          </span>
+        </div>
       </header>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-8 py-6">

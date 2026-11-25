@@ -1134,11 +1134,33 @@ fn export_result(app: AppHandle, id: String, path: String) -> Result<String, Str
     Ok(destination.to_string_lossy().to_string())
 }
 
+/// Guarda varias imágenes de la biblioteca en una carpeta elegida.
+#[tauri::command]
+fn export_results(app: AppHandle, ids: Vec<String>, folder: String) -> Result<usize, String> {
+    store::export_many(&app, &ids, &PathBuf::from(folder))
+}
+
+#[tauri::command]
+fn load_session(app: AppHandle) -> Result<store::Session, String> {
+    store::session(&app)
+}
+
+#[tauri::command]
+fn save_session(
+    app: AppHandle,
+    settings: store::Settings,
+    queue: Vec<store::QueuedItem>,
+) -> Result<(), String> {
+    store::save_session(&app, &settings, &queue)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(sidecar::Gpu::default())
         .manage(Gpus::default())
         .manage(Segmenter::default())
@@ -1161,6 +1183,9 @@ pub fn run() {
             delete_result,
             copy_result,
             export_result,
+            export_results,
+            load_session,
+            save_session,
             gpu_devices,
             search_sources,
             save_source,
