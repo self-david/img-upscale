@@ -568,13 +568,9 @@ fn ai_pipeline(
     }
     if !scaled {
         discard();
-        return Err(if attempts.len() > 1 {
-            format!(
-                "{last_error} Se probó también con mosaicos más pequeños; si se repite, usa un factor menor o el nivel Simple."
-            )
-        } else {
-            last_error
-        });
+        return Err(format!(
+            "{last_error} Se probó también con mosaicos más pequeños; si se repite, usa un factor menor o el nivel Simple."
+        ));
     }
 
     progress(84, "Ajustando tamaño");

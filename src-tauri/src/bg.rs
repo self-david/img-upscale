@@ -13,9 +13,6 @@ const SIZE: usize = 320;
 /// ONNX Runtime admite un único entorno por proceso: si se crea otro, la carga
 /// falla con «only one environment is allowed per process». Se crea una vez y
 /// todas las sesiones lo comparten.
-/// ONNX Runtime admite un único entorno por proceso: si se crea otro, la carga
-/// falla con «only one environment is allowed per process». Se crea una vez y
-/// todas las sesiones lo comparten.
 fn environment() -> Result<&'static ort::environment::Environment, String> {
     static ENV: OnceLock<Result<ort::environment::Environment, String>> = OnceLock::new();
     ENV.get_or_init(|| {

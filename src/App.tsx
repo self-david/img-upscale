@@ -151,7 +151,6 @@ const STATUS_CHIPS: Record<JobStatus, { label: string; className: string }> = {
 const ICONS = {
   spark: "M12 3l1.9 4.7L18.5 9.5l-4.6 1.8L12 16l-1.9-4.7L5.5 9.5l4.6-1.8zM18.5 15.5l.8 2 2 .8-2 .8-.8 2-.8-2-2-.8 2-.8z",
   image: "M4 5h16v14H4zM9 11a1.6 1.6 0 100-3.2A1.6 1.6 0 009 11zM4 16.5l5-4.5 4 3.5 3-2.5 4 3.5",
-  folder: "M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z",
   plus: "M12 5v14M5 12h14",
   x: "M6 6l12 12M18 6L6 18",
   check: "M20 6L9 17l-5-5",
@@ -399,11 +398,10 @@ export default function App() {
 
   const downloadResult = useCallback(async (result: StoredResult) => {
     try {
-      const extension = result.format === "jpg" ? "jpg" : result.format;
       const target = await save({
         title: "Guardar imagen",
         defaultPath: result.name,
-        filters: [{ name: "Imagen", extensions: [extension] }],
+        filters: [{ name: "Imagen", extensions: [result.format] }],
       });
       if (!target) return;
       await invoke("export_result", { id: result.id, path: target });
