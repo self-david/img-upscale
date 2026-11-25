@@ -239,6 +239,9 @@ export default function App() {
   const [comparing, setComparing] = useState<Item | null>(null);
   const [appVersion, setAppVersion] = useState("1.4");
   const [sessionReady, setSessionReady] = useState(!isTauri);
+  // la interfaz no se pinta hasta tener la sesión: así no aparece un instante
+  // con los ajustes por defecto y la cola vacía
+  const [sessionLoaded, setSessionLoaded] = useState(!isTauri);
   const [updateState, setUpdateState] = useState<
     "idle" | "checking" | "current" | "available" | "downloading" | "error"
   >("idle");
@@ -328,11 +331,17 @@ export default function App() {
           resultId: entry.resultId ?? undefined,
         }));
         if (restored.length > 0) setItems((previous) => (previous.length > 0 ? previous : restored));
+        if (cancelled) return;
+        // ajustes y cola se pintan juntos, ya restaurados
+        setSessionLoaded(true);
         // sólo se empieza a guardar si la sesión anterior se pudo leer: si no,
         // guardar los valores por defecto borraría la cola del usuario
-        if (!cancelled) setSessionReady(true);
+        setSessionReady(true);
       } catch (error) {
+        if (cancelled) return;
+        // sin sesión legible la app sigue siendo usable, pero no guarda nada
         setNotice(`No se pudo recuperar la sesión anterior: ${String(error)}`);
+        setSessionLoaded(true);
       }
     })();
     return () => {
@@ -774,6 +783,17 @@ export default function App() {
       setNotice(String(error));
     }
   }, [library]);
+
+  if (!sessionLoaded) {
+    return (
+      <div className="grid h-full w-full place-items-center bg-[#08090d] text-zinc-500">
+        <div className="flex items-center gap-3 text-[12px]">
+          <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-white/15 border-t-indigo-400" />
+          Recuperando tu sesión…
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-full min-h-0 w-full overflow-hidden bg-[#08090d] text-zinc-200">

@@ -1,6 +1,6 @@
 [package]
 name = "img-upscaler"
-version = "1.4.1"
+version = "1.4.2"
 description = "Escalador de imágenes local"
 authors = ["david"]
 edition = "2021"
