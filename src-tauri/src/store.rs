@@ -476,6 +476,7 @@ fn settings_row(conn: &Connection) -> Result<Settings, String> {
         .unwrap_or_default())
 }
 
+#[cfg(test)]
 fn settings_at(db: &Path) -> Result<Settings, String> {
     settings_row(&connect(db)?)
 }
@@ -529,6 +530,7 @@ fn queue_rows(conn: &Connection) -> Result<Vec<QueuedItem>, String> {
     Ok(out)
 }
 
+#[cfg(test)]
 fn queue_at(db: &Path) -> Result<Vec<QueuedItem>, String> {
     queue_rows(&connect(db)?)
 }
