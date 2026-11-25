@@ -245,7 +245,8 @@ export default function App() {
   const [updateVersion, setUpdateVersion] = useState("");
   const [updateProgress, setUpdateProgress] = useState(0);
   const updateRef = useRef<Update | null>(null);
-  const savedSession = useRef("");
+  const savedSettings = useRef("");
+  const savedQueue = useRef("");
 
   const updateItem = useCallback((id: string, patch: Partial<Item>) => {
     setItems((previous) =>
@@ -339,32 +340,44 @@ export default function App() {
     };
   }, []);
 
-  // guarda ajustes y cola para poder reanudar tras cerrar la app
+  // ajustes y cola se guardan por separado: cambiar uno no reescribe el otro
   useEffect(() => {
     if (!isTauri || !sessionReady) return;
-    const payload = {
-      settings: { level, scale, removeBg, quality, chroma, format: outFormat, device },
-      queue: items.map((item) => ({
-        id: item.id,
-        path: item.path,
-        name: item.name,
-        width: item.width,
-        height: item.height,
-        size: item.size,
-        status: item.status,
-        resultId: item.resultId ?? null,
-      })),
-    };
-    const raw = JSON.stringify(payload);
-    if (raw === savedSession.current) return;
+    const settings = { level, scale, removeBg, quality, chroma, format: outFormat, device };
+    const raw = JSON.stringify(settings);
+    if (raw === savedSettings.current) return;
     const timer = window.setTimeout(() => {
-      savedSession.current = raw;
-      void invoke("save_session", payload).catch((error) =>
-        setNotice(`No se pudo guardar la sesión: ${String(error)}`),
+      savedSettings.current = raw;
+      void invoke("save_settings", { settings }).catch((error) =>
+        setNotice(`No se pudieron guardar los ajustes: ${String(error)}`),
       );
-    }, 600);
+    }, 500);
     return () => window.clearTimeout(timer);
-  }, [items, level, scale, removeBg, quality, chroma, outFormat, device, sessionReady]);
+  }, [level, scale, removeBg, quality, chroma, outFormat, device, sessionReady]);
+
+  useEffect(() => {
+    if (!isTauri || !sessionReady) return;
+    const queue = items.map((item) => ({
+      id: item.id,
+      path: item.path,
+      name: item.name,
+      width: item.width,
+      height: item.height,
+      size: item.size,
+      status: item.status,
+      resultId: item.resultId ?? null,
+    }));
+    // el progreso no cuenta: mover el porcentaje no programa ninguna escritura
+    const key = queue.map((item) => `${item.id}|${item.status}|${item.resultId ?? ""}`).join("\n");
+    if (key === savedQueue.current) return;
+    const timer = window.setTimeout(() => {
+      savedQueue.current = key;
+      void invoke("save_queue", { queue }).catch((error) =>
+        setNotice(`No se pudo guardar la cola: ${String(error)}`),
+      );
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [items, sessionReady]);
 
   const copyResult = useCallback(async (result: StoredResult) => {
     try {

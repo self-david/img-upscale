@@ -1146,12 +1146,13 @@ fn load_session(app: AppHandle) -> Result<store::Session, String> {
 }
 
 #[tauri::command]
-fn save_session(
-    app: AppHandle,
-    settings: store::Settings,
-    queue: Vec<store::QueuedItem>,
-) -> Result<(), String> {
-    store::save_session(&app, &settings, &queue)
+fn save_settings(app: AppHandle, settings: store::Settings) -> Result<(), String> {
+    store::save_settings(&app, &settings)
+}
+
+#[tauri::command]
+fn save_queue(app: AppHandle, queue: Vec<store::QueuedItem>) -> Result<(), String> {
+    store::save_queue(&app, &queue)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1185,7 +1186,8 @@ pub fn run() {
             export_result,
             export_results,
             load_session,
-            save_session,
+            save_settings,
+            save_queue,
             gpu_devices,
             search_sources,
             save_source,

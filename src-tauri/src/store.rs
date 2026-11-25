@@ -466,8 +466,7 @@ fn file_at(db: &Path, id: &str) -> Result<String, String> {
     .ok_or_else(|| "Esa imagen ya no está en la biblioteca.".to_string())
 }
 
-fn settings_at(db: &Path) -> Result<Settings, String> {
-    let conn = connect(db)?;
+fn settings_row(conn: &Connection) -> Result<Settings, String> {
     let raw: Option<String> = conn
         .query_row("SELECT json FROM settings WHERE id = 1", [], |row| row.get(0))
         .optional()
@@ -477,10 +476,22 @@ fn settings_at(db: &Path) -> Result<Settings, String> {
         .unwrap_or_default())
 }
 
+fn settings_at(db: &Path) -> Result<Settings, String> {
+    settings_row(&connect(db)?)
+}
+
 fn settings_set_at(db: &Path, settings: &Settings) -> Result<(), String> {
     let conn = connect(db)?;
     let raw = serde_json::to_string(settings)
         .map_err(|_| "No se pudieron preparar los ajustes.".to_string())?;
+    let current: Option<String> = conn
+        .query_row("SELECT json FROM settings WHERE id = 1", [], |row| row.get(0))
+        .optional()
+        .map_err(|error| format!("No se pudieron leer los ajustes: {error}"))?;
+    // guardar lo mismo otra vez no debe tocar el disco
+    if current.as_deref() == Some(raw.as_str()) {
+        return Ok(());
+    }
     conn.execute(
         "INSERT INTO settings (id, json) VALUES (1, ?1)
          ON CONFLICT(id) DO UPDATE SET json = excluded.json",
@@ -490,8 +501,7 @@ fn settings_set_at(db: &Path, settings: &Settings) -> Result<(), String> {
     Ok(())
 }
 
-fn queue_at(db: &Path) -> Result<Vec<QueuedItem>, String> {
-    let conn = connect(db)?;
+fn queue_rows(conn: &Connection) -> Result<Vec<QueuedItem>, String> {
     let mut statement = conn
         .prepare(
             "SELECT id, path, name, width, height, size, status, result_id
@@ -519,8 +529,42 @@ fn queue_at(db: &Path) -> Result<Vec<QueuedItem>, String> {
     Ok(out)
 }
 
+fn queue_at(db: &Path) -> Result<Vec<QueuedItem>, String> {
+    queue_rows(&connect(db)?)
+}
+
+/// Huella de lo que de verdad se guarda: el progreso y los tiempos no cuentan.
+fn queue_fingerprint(items: &[QueuedItem]) -> String {
+    items
+        .iter()
+        .map(|item| {
+            let status = if item.status == "running" {
+                "pending"
+            } else {
+                item.status.as_str()
+            };
+            format!(
+                "{}|{}|{}|{}|{}x{}|{}|{}",
+                item.id,
+                item.path,
+                item.name,
+                item.size,
+                item.width,
+                item.height,
+                status,
+                item.result_id.as_deref().unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn queue_set_at(db: &Path, items: &[QueuedItem]) -> Result<(), String> {
     let mut conn = connect(db)?;
+    // el frontend guarda con frecuencia: si nada relevante cambió, no escribe
+    if queue_fingerprint(&queue_rows(&conn)?) == queue_fingerprint(items) {
+        return Ok(());
+    }
     let transaction = conn
         .transaction()
         .map_err(|error| format!("No se pudo guardar la cola: {error}"))?;
@@ -573,49 +617,63 @@ pub fn export(app: &AppHandle, id: &str, destination: &Path) -> Result<(), Strin
     export_at(&library(app)?, id, destination)
 }
 
-/// Guarda varias imágenes en una carpeta, sin pisar archivos existentes.
-pub fn export_many(app: &AppHandle, ids: &[String], folder: &Path) -> Result<usize, String> {
-    let db = library(app)?;
+/// Primer nombre libre de la carpeta (los duplicados pasan a `-2`, `-3`…).
+fn unique_destination(folder: &Path, name: &str) -> PathBuf {
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) => (stem.to_string(), format!(".{ext}")),
+        None => (name.to_string(), String::new()),
+    };
+    let mut target = folder.join(name);
+    let mut index = 2;
+    while target.exists() {
+        target = folder.join(format!("{stem}-{index}{ext}"));
+        index += 1;
+    }
+    target
+}
+
+/// Guarda varias imágenes en una carpeta con una sola conexión a la base.
+fn export_many_at(db: &Path, ids: &[String], folder: &Path) -> Result<usize, String> {
     fs::create_dir_all(folder).map_err(|_| "No se pudo crear la carpeta de destino.".to_string())?;
+    let conn = connect(db)?;
+    let source_dir = files_dir(db);
+    let mut statement = conn
+        .prepare("SELECT file, name FROM results WHERE id = ?1")
+        .map_err(|error| format!("No se pudo leer la biblioteca: {error}"))?;
     let mut saved = 0;
     for id in ids {
-        let stored: Option<String> = {
-            let conn = connect(&db)?;
-            conn.query_row("SELECT name FROM results WHERE id = ?1", [id], |row| {
-                row.get(0)
-            })
+        let row: Option<(String, String)> = statement
+            .query_row([id], |row| Ok((row.get(0)?, row.get(1)?)))
             .optional()
-            .map_err(|error| format!("No se pudo leer la biblioteca: {error}"))?
-        };
-        let Some(name) = stored else { continue };
-        let mut target = folder.join(&name);
-        let (stem, ext) = match name.rsplit_once('.') {
-            Some((stem, ext)) => (stem.to_string(), format!(".{ext}")),
-            None => (name.clone(), String::new()),
-        };
-        let mut index = 2;
-        while target.exists() {
-            target = folder.join(format!("{stem}-{index}{ext}"));
-            index += 1;
-        }
-        export_at(&db, id, &target)?;
+            .map_err(|error| format!("No se pudo leer la biblioteca: {error}"))?;
+        let Some((file, name)) = row else { continue };
+        let target = unique_destination(folder, &name);
+        fs::copy(source_dir.join(&file), &target)
+            .map_err(|_| "No se pudo guardar la imagen; comprueba que la carpeta sea accesible.".to_string())?;
         saved += 1;
     }
     Ok(saved)
 }
 
+pub fn export_many(app: &AppHandle, ids: &[String], folder: &Path) -> Result<usize, String> {
+    export_many_at(&library(app)?, ids, folder)
+}
+
 pub fn session(app: &AppHandle) -> Result<Session, String> {
     let db = library(app)?;
+    let conn = connect(&db)?;
     Ok(Session {
-        settings: settings_at(&db)?,
-        queue: queue_at(&db)?,
+        settings: settings_row(&conn)?,
+        queue: queue_rows(&conn)?,
     })
 }
 
-pub fn save_session(app: &AppHandle, settings: &Settings, queue: &[QueuedItem]) -> Result<(), String> {
-    let db = library(app)?;
-    settings_set_at(&db, settings)?;
-    queue_set_at(&db, queue)
+pub fn save_settings(app: &AppHandle, settings: &Settings) -> Result<(), String> {
+    settings_set_at(&library(app)?, settings)
+}
+
+pub fn save_queue(app: &AppHandle, queue: &[QueuedItem]) -> Result<(), String> {
+    queue_set_at(&library(app)?, queue)
 }
 
 /// Copia la imagen al portapapeles del sistema como mapa de bits.
@@ -861,6 +919,97 @@ mod tests {
             .collect();
         assert!(columns.contains(&"file".to_string()));
         assert!(!has_table(&conn, "results_legacy"));
+    }
+
+    #[test]
+    fn exports_many_without_overwriting() {
+        let dir = std::env::temp_dir().join("img-upscaler-lote");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("biblioteca.db");
+        let one = sample(&dir, "una.png", 40, 30);
+        let two = sample(&dir, "dos.png", 40, 30);
+        let first = add_at(&db, &one, "simple", 2).unwrap();
+        let second = add_at(&db, &two, "simple", 2).unwrap();
+        let ids = vec![first.id.clone(), second.id.clone()];
+
+        let folder = dir.join("exportado");
+        assert_eq!(export_many_at(&db, &ids, &folder).unwrap(), 2);
+        assert!(folder.join("una.png").is_file());
+        assert!(folder.join("dos.png").is_file());
+
+        // el segundo lote no pisa los archivos: los renombra
+        assert_eq!(export_many_at(&db, &ids, &folder).unwrap(), 2);
+        assert!(folder.join("una-2.png").is_file());
+        assert!(folder.join("dos-2.png").is_file());
+
+        // un id que ya no existe se salta sin romper el lote
+        let mut missing = ids.clone();
+        missing.push("no-existe".to_string());
+        assert_eq!(export_many_at(&db, &missing, &folder).unwrap(), 2);
+    }
+
+    #[test]
+    fn redundant_saves_do_not_touch_the_database() {
+        let dir = std::env::temp_dir().join("img-upscaler-escrituras");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("biblioteca.db");
+
+        let settings = Settings {
+            level: Some("simple".into()),
+            scale: Some(2),
+            ..Settings::default()
+        };
+        settings_set_at(&db, &settings).unwrap();
+        let item = QueuedItem {
+            id: "uno".into(),
+            path: "C:/foto.jpg".into(),
+            name: "foto.jpg".into(),
+            width: 10,
+            height: 8,
+            size: 9,
+            status: "pending".into(),
+            result_id: None,
+        };
+        queue_set_at(&db, &[item.clone()]).unwrap();
+
+        // `data_version` sólo sube cuando otra conexión confirma una escritura
+        let monitor = Connection::open(&db).unwrap();
+        let version = || -> i64 {
+            monitor
+                .query_row("PRAGMA data_version", [], |row| row.get(0))
+                .unwrap()
+        };
+
+        let before = version();
+        settings_set_at(&db, &settings).unwrap();
+        queue_set_at(&db, &[item.clone()]).unwrap();
+        assert_eq!(before, version(), "guardar lo mismo no debe escribir");
+
+        settings_set_at(
+            &db,
+            &Settings {
+                quality: Some(95),
+                ..settings.clone()
+            },
+        )
+        .unwrap();
+        let changed = version();
+        assert_ne!(before, changed, "un ajuste distinto sí debe guardarse");
+
+        // «running» se guarda como pendiente: tampoco es un cambio real
+        let mut moving = item.clone();
+        moving.status = "running".into();
+        queue_set_at(&db, &[moving]).unwrap();
+        assert_eq!(changed, version());
+
+        // pero un resultado asociado o un estado final sí se guardan
+        let mut finished = item.clone();
+        finished.status = "done".into();
+        finished.result_id = Some("abc".into());
+        queue_set_at(&db, &[finished]).unwrap();
+        assert_ne!(changed, version());
     }
 
     #[test]
